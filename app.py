@@ -1,18 +1,16 @@
 from flask import Flask, jsonify, request
 import asyncio
-from playwright.async_api import async_playwright, TimeoutError # TimeoutError importálása!
+from playwright.async_api import async_playwright, TimeoutError 
 import os
 import json
-import datetime
+import datetime 
 
 app = Flask(__name__)
 
-# Kiegészítés 1: Definiáljuk a Tubi API Alap URL mintát
-# Ez a minta a kliensben is szerepel, de a szervernek is tudnia kell róla, hogy megvárja.
+# KRITIKUS KONSTANS: A Tubi API alap URL-je
 TUBI_API_BASE_URL_PATTERN = "https://search.production-public.tubi.io/api/v2/search"
 
 async def scrape_website_with_network_log(url):
-    # Log string kezdő timestamp
     log_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
     results = {
@@ -23,7 +21,7 @@ async def scrape_website_with_network_log(url):
         "console_logs": [], 
         "simple_network_log": [f"[{log_time}] --- Egyszerűsített Hálózati Log Indul ---"],
         "status": "failure",
-        "error": "" # Kiegészítés 2: Hibaüzenet mező
+        "error": "" 
     }
     
     har_path = f"/tmp/network_{os.getpid()}.har" 
@@ -35,7 +33,7 @@ async def scrape_website_with_network_log(url):
         context = await browser.new_context(record_har_path=har_path)
         page = await context.new_page()
 
-        # Konzol és hálózati logolás (változatlan)
+        # Konzol és hálózati logolás
         def log_console_message(msg):
             results["console_logs"].append({
                 "type": msg.type,
@@ -58,13 +56,11 @@ async def scrape_website_with_network_log(url):
         try:
             results["simple_network_log"].append(f"Navigálás az oldalra: {url}")
             
-            # Módosítás 3: Navigáció domcontentloaded-re, ami gyorsabb
             await page.goto(url, wait_until="domcontentloaded", timeout=60000)
             
             results["simple_network_log"].append("DomContentLoaded állapot elérve. Várakozás a Tubi API válaszára.")
             
-            # Módosítás 4: Explicit várakozás a kulcsfontosságú Tubi API válaszára
-            # Ez a garancia arra, hogy a kért tartalom bekerül a HAR logba.
+            # Explicit várakozás a kulcsfontosságú Tubi API válaszára
             await page.wait_for_response(TUBI_API_BASE_URL_PATTERN, timeout=30000) 
             
             results["simple_network_log"].append(f"✅ Tubi API válasz megérkezett: {TUBI_API_BASE_URL_PATTERN}")
@@ -113,10 +109,9 @@ def run_scrape():
         }), 500
     
     if data.get('status') == 'failure':
-         # Ha a Playwright hiba történt, 500-as státusszal térünk vissza a kliensnek
          return jsonify(data), 500 
             
     return jsonify(data)
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    app.run(debug=True, port=os.environ.get('PORT', 5000))
