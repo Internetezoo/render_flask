@@ -143,16 +143,23 @@ def make_internal_tubi_api_call(search_url: str, access_token: str, device_id: s
         # Headerek összeállítása
         cookie_value = f'deviceId={device_id}; at={access_token}'
         
+        # Ugyanazokat a Stealth headereket használjuk, mint a Playwright-ban, 
+        # hogy szinkronban legyenek a hívások
         headers = {
             'X-Tubi-Client-Name': 'web',
             'X-Tubi-Client-Version': '5.2.1',  
             'Content-Type': 'application/json',
             'Referer': 'https://tubitv.com/',
             'Origin': 'https://tubitv.com',
-            # EZ A HEADER KRITIKUS
+            # STEALTH HEADEREK
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+            'Accept-Language': 'en-US,en;q=0.9,hu;q=0.8',
+            'DNT': '1', 
+            'Sec-Fetch-Site': 'same-origin',
+            
+            # AUTH HEADEREK
             'Cookie': cookie_value, 
-            'Authorization': f'Bearer {access_token}', # KRITIKUS FEJLÉC
+            'Authorization': f'Bearer {access_token}', 
             'x-client-id': 'web',
             'x-tubi-client-id': 'web',
         }
@@ -176,7 +183,7 @@ def make_internal_tubi_api_call(search_url: str, access_token: str, device_id: s
         return {'api_call_status': 'failure', 'error': f'Unexpected Error: {e}'}
 
 
-# --- FŐ ASZINKRON SCRAPE FÜGGVÉNY (Stealth beállításokkal frissítve) ---
+# --- FŐ ASZINKRON SCRAPE FÜGGVÉNY (Várakozási időkkel frissítve) ---
 async def scrape_tubitv(url: str, har_enabled: bool) -> dict:
     browser = None
     har_path = None
@@ -215,19 +222,23 @@ async def scrape_tubitv(url: str, har_enabled: bool) -> dict:
                 # Kiegészítő HTTP Headerek, hogy ne tűnjön botnak
                 extra_http_headers={
                     'Accept-Language': 'en-US,en;q=0.9,hu;q=0.8',
-                    'DNT': '1', # Do Not Track (a legtöbb böngésző alapból küldi)
+                    'DNT': '1', 
                     'Sec-Fetch-Site': 'same-origin',
                 }
             )
             
             page = await context.new_page()
 
-            # Kisebb késleltetés hozzáadása, hogy élethűbb legyen a navigálás
-            await page.wait_for_timeout(2000) # 2 másodperc
-            # --- STEALTH MÓDOSÍTÁSOK VÉGE ---
-
+            # 🛑 JAVÍTÁS: Késleltetés növelése navigálás előtt (5 másodperc)
+            await page.wait_for_timeout(5000) 
+            
             # Navigálás és várakozás
             await page.goto(url, wait_until="networkidle", timeout=90000)
+            
+            # 🛑 JAVÍTÁS: Kiegészítő várakozás a JavaScript futásának befejezésére (3 másodperc)
+            await page.wait_for_timeout(3000) 
+            
+            # --- STEALTH MÓDOSÍTÁSOK VÉGE ---
             
             # HTML kinyerése
             results['full_html'] = await page.content()
