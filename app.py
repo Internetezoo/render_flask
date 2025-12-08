@@ -3,83 +3,87 @@ import asyncio
 from playwright.async_api import async_playwright
 import os
 import json
+import datetime
 
 app = Flask(__name__)
 
-# Aszinkron funkció a web scraping és hálózati logolás elvégzésére
 async def scrape_website_with_network_log(url):
+    # Log string kezdő timestamp
+    log_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
     results = {
         "url": url,
         "title": "",
         "full_html": "",
         "har_log": "HAR log nem készült.",
-        "console_logs": [], # <-- ÚJ KULCS A KONZOL LOGOKNAK
+        "console_logs": [], 
+        "simple_network_log": [f"[{log_time}] --- Egyszerűsített Hálózati Log Indul ---"], # <-- ÚJ KULCS
         "status": "failure"
     }
     
-    # A HAR (HTTP Archive) a teljes hálózati forgalmat rögzíti, mint a DevTools.
-    # Ideiglenes fájl szükséges a HAR mentéséhez, a Playwright ezt kezeli.
     har_path = f"/tmp/network_{os.getpid()}.har" 
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
-            # Fontos: sandbox kikapcsolása konténer környezetben
             args=['--no-sandbox', '--disable-setuid-sandbox'] 
         )
-        
-        # Létrehozunk egy BrowserContext-et a HAR rögzítéssel
         context = await browser.new_context(record_har_path=har_path)
         page = await context.new_page()
 
-        # ÚJ LOGIKA: Konzol események gyűjtése
+        # Konzol események gyűjtése
         def log_console_message(msg):
-            """Rögzíti a console.log, console.error stb. üzeneteket."""
             results["console_logs"].append({
-                "type": msg.type, # pl. 'log', 'error', 'warning'
+                "type": msg.type,
                 "text": msg.text,
                 "location": msg.location['url'] if msg.location else 'N/A'
             })
-            
         page.on("console", log_console_message)
-        # ------------------------------------
+        
+        # Egyszerűsített hálózati log gyűjtése (a kért egyszerű log)
+        def log_request(request):
+            log_entry = f"KÉRÉS | Típus: {request.resource_type:<10} | URL: {request.url}"
+            results["simple_network_log"].append(log_entry)
+        
+        def log_response(response):
+            log_entry = f"VÁLASZ | Státusz: {response.status:<3} | URL: {response.url}"
+            results["simple_network_log"].append(log_entry)
+
+        page.on("request", log_request)
+        page.on("response", log_response)
 
         try:
-            # 1. Navigáció és JS futtatás
-            # Várakozás a teljes oldal betöltésére (lassabb, de biztosítja a JS futását)
-            await page.goto(url, wait_until="networkidle", timeout=60000) # 60 mp timeout
+            results["simple_network_log"].append(f"Navigálás az oldalra: {url}")
+            await page.goto(url, wait_until="networkidle", timeout=60000)
+            results["simple_network_log"].append("A fő kérés (networkidle) befejeződött.")
             
-            # 2. HTML és Cím kinyerése (JS futás utáni állapot)
             results["title"] = await page.title()
             results["full_html"] = await page.content() 
             results["status"] = "success"
 
         except Exception as e:
             results["error"] = f"Playwright hiba történt a navigáció során: {str(e)}"
+            results["simple_network_log"].append(f"HIBA: {str(e)}")
         
         finally:
-            # 3. HAR adatok kinyerése és a fájl bezárása
             await context.close()
             await browser.close()
             
-            # 4. A rögzített HAR fájl tartalmának beolvasása
+            # HAR log beolvasása
             try:
                 with open(har_path, 'r', encoding='utf-8') as f:
-                    # Mivel a HAR egy nagy JSON, beolvassuk és eltároljuk a válaszban
                     results["har_log"] = json.load(f)
-            except FileNotFoundError:
-                 results["har_log"] = "Hiba: HAR log fájl nem található."
-            except json.JSONDecodeError:
-                 results["har_log"] = "Hiba: A HAR fájl tartalma nem érvényes JSON."
+            except (FileNotFoundError, json.JSONDecodeError):
+                 results["har_log"] = "Hiba: HAR log nem készült vagy érvénytelen."
             
-            # 5. Tisztítás: Töröljük az ideiglenes HAR fájlt
             if os.path.exists(har_path):
                  os.remove(har_path)
+            
+            results["simple_network_log"].append("--- Egyszerűsített Hálózati Log Befejeződött ---")
             
     return results
 
 @app.route('/scrape', methods=['GET'])
 def run_scrape():
-    """Flask útvonal a scrape folyamat indításához."""
     target_url = request.args.get('url', 'https://example.com')
 
     try:
@@ -90,12 +94,10 @@ def run_scrape():
             "error": f"Aszinkron futási hiba: {str(e)}"
         }), 500
     
-    # Ha a Playwright hiba történt, 500-as státusszal térünk vissza a kliensnek
     if data.get('status') == 'failure':
         return jsonify(data), 500
         
     return jsonify(data)
 
 if __name__ == '__main__':
-    # Helyi teszteléshez
     app.run(debug=True, port=5000)
