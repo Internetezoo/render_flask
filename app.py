@@ -13,6 +13,7 @@ async def scrape_website_with_network_log(url):
         "title": "",
         "full_html": "",
         "har_log": "HAR log nem készült.",
+        "console_logs": [], # <-- ÚJ KULCS A KONZOL LOGOKNAK
         "status": "failure"
     }
     
@@ -29,6 +30,18 @@ async def scrape_website_with_network_log(url):
         # Létrehozunk egy BrowserContext-et a HAR rögzítéssel
         context = await browser.new_context(record_har_path=har_path)
         page = await context.new_page()
+
+        # ÚJ LOGIKA: Konzol események gyűjtése
+        def log_console_message(msg):
+            """Rögzíti a console.log, console.error stb. üzeneteket."""
+            results["console_logs"].append({
+                "type": msg.type, # pl. 'log', 'error', 'warning'
+                "text": msg.text,
+                "location": msg.location['url'] if msg.location else 'N/A'
+            })
+            
+        page.on("console", log_console_message)
+        # ------------------------------------
 
         try:
             # 1. Navigáció és JS futtatás
