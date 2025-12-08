@@ -1,122 +1,180 @@
-from flask import Flask, jsonify, request
 import asyncio
-from playwright.async_api import async_playwright
-import os
+import nest_asyncio
 import json
-import datetime
-import nest_asyncio # Importálva a Gunicorn stabilitásáért
+import logging
+import base64 # Szükséges a Base64 dekódoláshoz, ha a HAR log úgy tárolja a válasz tartalmát
+from flask import Flask, request, jsonify
+from playwright.async_api import async_playwright
 
-# ALKALMAZÁS INICIALIZÁLÁSA
-app = Flask(__name__)
-
-# JAVÍTÁS: A Gunicorn/Playwright aszinkron probléma megoldása.
-# Engedélyezi az asyncio.run() hívását egy már futó event loopon belül.
+# Engedélyezi az aszinkron funkciók beágyazását (szükséges a Gunicorn + Playwright async használatához)
 nest_asyncio.apply()
 
-# A kliens script továbbra is ezt használja a kereséshez.
-TUBI_API_BASE_URL_PATTERN = "https://search.production-public.tubi.io/api/v2/search"
+app = Flask(__name__)
+# Csökkenti a JSON válasz méretét, ami gyorsítja az átvitelt
+app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
+logging.basicConfig(level=logging.INFO)
 
-async def scrape_website_with_network_log(url):
-    log_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+# --- SEGÉDFÜGGVÉNY A TOKEN KINYERÉSÉRE (SZERVER OLDALON) ---
+def extract_tubi_token_from_har(har_data: dict) -> str | None:
+    """Kinyeri az access_token-t a Tubi TV HAR logjából a 'device/anonymous/token' válaszából."""
+    TUBI_TOKEN_ENDPOINT = "account.production-public.tubi.io/device/anonymous/token"
+    
+    if not har_data or not isinstance(har_data, dict) or 'log' not in har_data:
+        return None
+        
+    try:
+        for entry in har_data['log']['entries']:
+            url = entry['request']['url']
+            
+            # 1. Megkeresi a token lekérő kérést
+            if TUBI_TOKEN_ENDPOINT in url:
+                
+                # 2. Megvizsgálja a válasz tartalmát (content)
+                response_content = entry['response']['content']
+                
+                if response_content and 'text' in response_content:
+                    response_text = response_content['text']
+                    
+                    # HAR specifikáció: ha az encoding Base64, dekódolni kell
+                    if response_content.get('encoding') == 'base64':
+                        try:
+                             response_text = base64.b64decode(response_text).decode('utf-8')
+                        except:
+                             logging.warning("Base64 dekódolási hiba.")
+                             continue
+                            
+                    # 3. Elemezi a JSON stringet
+                    try:
+                        response_json = json.loads(response_text)
+                        
+                        # 4. Kinyeri a tokent
+                        access_token = response_json.get('access_token')
+                        
+                        if access_token:
+                            return access_token
+                            
+                    except json.JSONDecodeError:
+                        logging.warning(f"Nem érvényes JSON válasz a token endpoint-ról.")
+                        continue
+                        
+        return None
+        
+    except KeyError as e:
+        logging.error(f"Hiba a HAR bejegyzés feldolgozásakor: {e}")
+        return None
+
+# --- PLAYWRIGHT SCRAPING FÜGGVÉNY (JAVÍTVA) ---
+async def scrape_website_with_network_log(url: str, har_enabled: bool = False, request_args: dict = None) -> dict:
     
     results = {
-        "url": url,
-        "title": "",
-        "full_html": "",
-        "har_log": "HAR log nem készült.",
-        "console_logs": [], 
-        "simple_network_log": [f"[{log_time}] --- Egyszerűsített Hálózati Log Indul ---"],
-        "status": "failure",
-        "error": "" 
+        'status': 'failure',
+        'error': 'Ismeretlen hiba történt.',
+        'full_html': None,
+        'console_logs': [],
+        'simple_network_log': [],
+        'har_log': None,
+        'tubi_token': None, # Ez lesz a szerver által kinyert token
     }
     
-    # A fájlútvonal az ideiglenes könyvtárban van definiálva a Render/Linux kompatibilitás érdekében
-    har_path = f"/tmp/network_{os.getpid()}.har" 
-
-    browser = None
-    context = None
+    # HAR logolás mindenképp szükséges, ha a token kinyerése a cél
+    if not har_enabled:
+        # Ha a HAR-t nem kérte a kliens, de a token kell, a belső logolást bekapcsoljuk
+        # A Flask route-ban a 'har' paramétert használjuk ennek eldöntésére
+        pass # A Flask route-ban kezeljük, de itt a har_enabled jelzi, hogy mi történik
     
-    async with async_playwright() as p:
-        try:
-            browser = await p.chromium.launch(
-                # A Render környezet megköveteli a --no-sandbox argumentumokat
-                args=['--no-sandbox', '--disable-setuid-sandbox'] 
+    
+    browser = None # Inicializálás a finally blokk számára
+    try:
+        async with async_playwright() as p:
+            # Csak a Chromium kell a Playwright install chromium miatt
+            browser = await p.chromium.launch() 
+            
+            # Context létrehozása HAR logolással, ha engedélyezve van
+            context = await browser.new_context(
+                record_har_mode='full' if har_enabled else None,
+                # Fontos: omit_content=False, hogy a válasz testét is rögzítse
+                record_har_omit_content=False if har_enabled else True, 
             )
-            context = await browser.new_context(record_har_path=har_path)
-            page = await context.new_page()
-
-            # ... Konzol és hálózati logolás (változatlan) ...
-            def log_console_message(msg):
-                results["console_logs"].append({"type": msg.type, "text": msg.text, "location": msg.location['url'] if msg.location else 'N/A'})
-            page.on("console", log_console_message)
-            def log_request(request):
-                log_entry = f"KÉRÉS | Típus: {request.resource_type:<10} | URL: {request.url}"
-                results["simple_network_log"].append(log_entry)
-            def log_response(response):
-                log_entry = f"VÁLASZ | Státusz: {response.status:<3} | URL: {response.url}"
-                results["simple_network_log"].append(log_entry)
-            page.on("request", log_request)
-            page.on("response", log_response)
-            # ...
-
-            results["simple_network_log"].append(f"Navigálás az oldalra: {url}")
-            
-            # 🚀 JAVÍTÁS A TELJESÍTMÉNYÉRT: networkidle -> domcontentloaded
-            # Ezzel elkerülhető a hosszas várakozás a háttérben lévő, felesleges hívásokra.
-            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            
-            results["simple_network_log"].append("A fő kérés (domcontentloaded) befejeződött.")
-            
-            # ⏱️ JAVÍTÁS A TIMEOUT-ÉRT: 6 másodperc -> 1 másodperc
-            # Csökkenti a teljes végrehajtási időt a Render limitjének betartása érdekében.
-            await asyncio.sleep(1) 
-            results["simple_network_log"].append("1 másodpercnyi extra várakozás a HAR log teljességéért.")
-            
-            results["title"] = await page.title()
-            results["full_html"] = await page.content() 
-            results["status"] = "success"
-
-        except Exception as e:
-            error_msg = f"Playwright hiba történt a navigáció során: {str(e)}"
-            results["error"] = error_msg
-            results["simple_network_log"].append(f"HIBA: {error_msg}")
-        
-        finally:
-            if context:
-                await context.close()
-            if browser:
-                await browser.close()
+            if har_enabled:
+                logging.info("HAR logolás engedélyezve.")
                 
-            # HAR log beolvasása (változatlan)
-            try:
-                with open(har_path, 'r', encoding='utf-8') as f:
-                    results["har_log"] = json.load(f)
-            except (FileNotFoundError, json.JSONDecodeError):
-                results["har_log"] = "Hiba: HAR log nem készült vagy érvénytelen."
+            page = await context.new_page()
             
-            if os.path.exists(har_path):
-                os.remove(har_path)
+            # ... (Hálózati logok és Konzol logok gyűjtése logikája) ...
+            simple_network_log = []
+            page.on("request", lambda request: simple_network_log.append(f"KÉRÉS | Típus: {request.resource_type:<10} | URL: {request.url}"))
+            page.on("response", lambda response: simple_network_log.append(f"VÁLASZ | Státusz: {response.status:<3} | URL: {response.url}"))
+
+            console_logs = []
+            page.on("console", lambda msg: console_logs.append({
+                'type': msg.type, 
+                'text': msg.text, 
+                'location': msg.location['url'] if msg.location and 'url' in msg.location else 'N/A'
+            }))
             
-            results["simple_network_log"].append("--- Egyszerűsített Hálózati Log Befejeződött ---")
+            # Navigálás: 45mp-re emelve a Gunicorn timeout miatt
+            await page.goto(url, wait_until='domcontentloaded', timeout=45000) 
+            await asyncio.sleep(1.5) # Várakozás a dinamikus betöltésre
+
+            results['full_html'] = await page.content()
+            results['console_logs'] = console_logs
+            results['simple_network_log'] = simple_network_log
+            results['status'] = 'success'
+
+            # --- SZERVER OLDALI FELDOLGOZÁS ---
+            if har_enabled:
+                har_log = await context.har() 
+                
+                # 1. Token kinyerése
+                token = extract_tubi_token_from_har(har_log)
+                if token:
+                    results['tubi_token'] = token
+                    logging.info("Tubi token sikeresen kinyerve a szerveren.")
+                
+                # 2. HAR log feltöltése a válaszba, ha a kliens KÉRTE ('har' paraméter = true)
+                # A request_args-ot a Flask route-ból kapjuk meg
+                if request_args and request_args.get('har', 'false').lower() == 'true':
+                    results['har_log'] = har_log
+                    logging.info("HAR log visszaküldve a kliens kérésére.")
+                else:
+                    # Sávszélesség spórolás: ha a token megvan és nem kérték a HAR-t, nem küldjük el
+                    logging.info("HAR log elhagyva a válaszból (optimalizáció).")
+
+
+    except Exception as e:
+        results['status'] = 'failure'
+        results['error'] = str(e)
+        logging.error(f"Scraping hiba: {e}")
+        
+    finally:
+        if browser:
+            await browser.close()
             
     return results
 
-# Útvonal-kezelő
+# --- FLASK ROUTE (JAVÍTVA) ---
 @app.route('/scrape', methods=['GET'])
-def run_scrape():
-    target_url = request.args.get('url', 'https://example.com')
-    try:
-        # Az asyncio.run() hívás most már biztonságos a nest_asyncio miatt
-        data = asyncio.run(scrape_website_with_network_log(target_url))
-    except RuntimeError as e:
-        return jsonify({"status": "failure", "error": f"Aszinkron futási hiba: {str(e)}"}), 500
-        
-    if data.get('status') == 'failure':
-         return jsonify(data), 500 
-         
+def scrape_endpoint():
+    url = request.args.get('url')
+    # A HAR logolás engedélyezése szükséges a szerver oldali kinyeréshez
+    har_enabled = request.args.get('har', 'false').lower() == 'true' or request.args.get('target_api', 'false').lower() == 'true'
+
+    if not url:
+        return jsonify({'status': 'failure', 'error': 'Hiányzó URL paraméter.'}), 400
+
+    logging.info(f"Kérés érkezett: {url}, HAR logolás: {har_enabled}")
+    
+    # asyncio futtatása a Flask szálban
+    loop = asyncio.get_event_loop()
+    if loop.is_running():
+        # Átadjuk a kérés argumentumait a scrape függvénynek
+        data = loop.run_until_complete(scrape_website_with_network_log(url, har_enabled, request.args))
+    else:
+        # Ez a blokk fut le, ha a Flaskot simán futtatjuk
+        data = asyncio.run(scrape_website_with_network_log(url, har_enabled, request.args))
+
     return jsonify(data)
 
-# Ez a blokk csak akkor fut, ha lokálisan indítja.
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', debug=True, port=port)
+    # Helyi teszteléshez
+    app.run(host='0.0.0.0', port=5000, debug=True)
