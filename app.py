@@ -4,9 +4,9 @@ from playwright.async_api import async_playwright
 import os
 import json
 import datetime
-import nest_asyncio # 💡 Új import a Gunicorn stabilitásáért
+import nest_asyncio # Importálva a Gunicorn stabilitásáért
 
-# ALKALMAZÁS INICIALIZÁLÁSA (Kijavítva a NameError-t)
+# ALKALMAZÁS INICIALIZÁLÁSA
 app = Flask(__name__)
 
 # JAVÍTÁS: A Gunicorn/Playwright aszinkron probléma megoldása.
@@ -33,9 +33,8 @@ async def scrape_website_with_network_log(url):
     # A fájlútvonal az ideiglenes könyvtárban van definiálva a Render/Linux kompatibilitás érdekében
     har_path = f"/tmp/network_{os.getpid()}.har" 
 
-    # Hozzáadtam a 'browser' változót None-ra inicializálva, hogy a 'finally' blokkban 
-    # is biztonságosan tudja bezárni, ha a launch hibázna.
     browser = None
+    context = None
     
     async with async_playwright() as p:
         try:
@@ -62,14 +61,16 @@ async def scrape_website_with_network_log(url):
 
             results["simple_network_log"].append(f"Navigálás az oldalra: {url}")
             
-            # Visszatérés a networkidle-höz.
-            await page.goto(url, wait_until="networkidle", timeout=60000)
+            # 🚀 JAVÍTÁS A TELJESÍTMÉNYÉRT: networkidle -> domcontentloaded
+            # Ezzel elkerülhető a hosszas várakozás a háttérben lévő, felesleges hívásokra.
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
             
-            results["simple_network_log"].append("A fő kérés (networkidle) befejeződött.")
+            results["simple_network_log"].append("A fő kérés (domcontentloaded) befejeződött.")
             
-            # KRITIKUS JAVÍTÁS: Extrém hosszú, 6 másodperces várakozás a HAR logolás befejezéséhez.
-            await asyncio.sleep(6) 
-            results["simple_network_log"].append("6 másodpercnyi extra várakozás a HAR log teljességéért.")
+            # ⏱️ JAVÍTÁS A TIMEOUT-ÉRT: 6 másodperc -> 1 másodperc
+            # Csökkenti a teljes végrehajtási időt a Render limitjének betartása érdekében.
+            await asyncio.sleep(1) 
+            results["simple_network_log"].append("1 másodpercnyi extra várakozás a HAR log teljességéért.")
             
             results["title"] = await page.title()
             results["full_html"] = await page.content() 
@@ -105,7 +106,7 @@ async def scrape_website_with_network_log(url):
 def run_scrape():
     target_url = request.args.get('url', 'https://example.com')
     try:
-        # Az asyncio.run() hívás most már biztonságos a nest_asyncio.apply() miatt
+        # Az asyncio.run() hívás most már biztonságos a nest_asyncio miatt
         data = asyncio.run(scrape_website_with_network_log(target_url))
     except RuntimeError as e:
         return jsonify({"status": "failure", "error": f"Aszinkron futási hiba: {str(e)}"}), 500
@@ -115,10 +116,7 @@ def run_scrape():
          
     return jsonify(data)
 
-# Ez a blokk csak akkor fut, ha lokálisan indítja (pl. python app.py), 
-# Gunicorn nem használja a Render-en.
+# Ez a blokk csak akkor fut, ha lokálisan indítja.
 if __name__ == '__main__':
-    # Helyi futtatáshoz a '0.0.0.0' használata javasolt, ha konténerben van
-    # Bár a Gunicorn felülírja a portot a Render környezeti változójával.
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', debug=True, port=port)
