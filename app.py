@@ -30,7 +30,7 @@ TUBI_API_TEMPLATE = (
     "search={search_term}&include_channels=true&include_linear=true&is_kids_mode=false"
 )
 
-# --- JAVÍTOTT SEGÉDFÜGGVÉNY: TOKEN KINYERÉSE ---
+# --- SEGÉDFÜGGVÉNYEK (VÁLTOZATLAN) ---
 def extract_tubi_token_from_har(har_data: dict) -> str | None:
     """
     Kinyeri az access_token-t a Tubi TV HAR logjából a 'device/anonymous/token' válaszából,
@@ -79,18 +79,12 @@ def extract_tubi_token_from_har(har_data: dict) -> str | None:
         logging.error(f"Hiba a Tubi token kinyerésekor: {e}")
         return None
 
-
-# --- JAVÍTOTT SEGÉDFÜGGVÉNY: Device ID kinyerése ---
 def extract_device_id_from_har(har_log: dict) -> str | None:
-    """
-    Kinyeri a friss 'deviceId' cookie-t a HAR logból.
-    Keresi a Set-Cookie fejlécben (válasz), a Cookie fejlécben (kérés) és a POST törzsben.
-    """
+    # (A device ID kinyerésének logikája változatlan)
     if not har_log or 'entries' not in har_log.get('log', {}):
         return None
 
     for entry in har_log['log']['entries']:
-        # 1. Keresés a Set-Cookie fejlécben (válasz)
         if 'response' in entry and 'headers' in entry['response']:
             for header in entry['response']['headers']:
                 if header.get('name', '').lower() == 'set-cookie':
@@ -99,7 +93,6 @@ def extract_device_id_from_har(har_log: dict) -> str | None:
                         logging.info("Device ID sikeresen kinyerve a Set-Cookie-ból.")
                         return match.group(1).strip()
         
-        # 2. Keresés a Cookie fejlécben (kérés)
         if 'request' in entry and 'headers' in entry['request']:
             for header in entry['request']['headers']:
                  if header.get('name', '').lower() == 'cookie':
@@ -108,7 +101,6 @@ def extract_device_id_from_har(har_log: dict) -> str | None:
                          logging.info("Device ID sikeresen kinyerve a Cookie fejlécből.")
                          return match.group(1).strip()
 
-        # 3. Keresés a POST kérések törzsében
         if 'request' in entry and entry['request'].get('method') == 'POST':
              if '/device/anonymous/' in entry['request'].get('url', ''):
                  post_data = entry['request'].get('postData', {}).get('text')
@@ -124,47 +116,32 @@ def extract_device_id_from_har(har_log: dict) -> str | None:
     logging.warning("Nem találtam Device ID-t a HAR logban.")
     return None
 
-# --- ÚJ FÜGGVÉNY: Tubi API hívás a Render szerveren belül ---
 def make_internal_tubi_api_call(search_url: str, access_token: str, device_id: str) -> dict | None:
-    """
-    Belső Tubi API hívást hajt végre a Render szerveren lévő tokenekkel.
-    """
+    # (A belső API hívás logikája változatlan)
     logging.info("Indul a belső Tubi API kérés a geo-korlátozás megkerülésére...")
     
     try:
-        # A search term kinyerése az URL-ből
         parsed_url = urlparse(search_url)
-        # Az utolsó elem a search term, de URL-kódolt lehet
         search_term_encoded = parsed_url.path.split('/')[-1]
-        
-        # A full_api_url felépítése a template-ből
         full_api_url = TUBI_API_TEMPLATE.format(search_term=search_term_encoded)
-        
-        # Headerek összeállítása
         cookie_value = f'deviceId={device_id}; at={access_token}'
         
-        # Ugyanazokat a Stealth headereket használjuk, mint a Playwright-ban, 
-        # hogy szinkronban legyenek a hívások
         headers = {
             'X-Tubi-Client-Name': 'web',
             'X-Tubi-Client-Version': '5.2.1',  
             'Content-Type': 'application/json',
             'Referer': 'https://tubitv.com/',
             'Origin': 'https://tubitv.com',
-            # STEALTH HEADEREK
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
             'Accept-Language': 'en-US,en;q=0.9,hu;q=0.8',
             'DNT': '1', 
             'Sec-Fetch-Site': 'same-origin',
-            
-            # AUTH HEADEREK
             'Cookie': cookie_value, 
             'Authorization': f'Bearer {access_token}', 
             'x-client-id': 'web',
             'x-tubi-client-id': 'web',
         }
         
-        # Szinkron requests hívás (Render szerverről)
         response = requests.get(full_api_url, headers=headers, timeout=30)
         response.raise_for_status()
         
@@ -183,7 +160,7 @@ def make_internal_tubi_api_call(search_url: str, access_token: str, device_id: s
         return {'api_call_status': 'failure', 'error': f'Unexpected Error: {e}'}
 
 
-# --- FŐ ASZINKRON SCRAPE FÜGGVÉNY (Várakozási időkkel frissítve) ---
+# --- FŐ ASZINKRON SCRAPE FÜGGVÉNY (LOGIKAI KORREKCIÓVAL FRISSÍTVE) ---
 async def scrape_tubitv(url: str, har_enabled: bool) -> dict:
     browser = None
     har_path = None
@@ -198,10 +175,8 @@ async def scrape_tubitv(url: str, har_enabled: bool) -> dict:
         'tubi_api_data': None, 
     }
     
-    # Kinyeri a keresési szót, mert ez kell a Playwright logikájához
     search_query = urlparse(url).path.split('/')[-1] if 'search/' in url else 'home'
     
-    # Ideiglenes fájl létrehozása a HAR-nak
     if har_enabled:
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.har')
         har_path = temp_file.name
@@ -209,17 +184,12 @@ async def scrape_tubitv(url: str, har_enabled: bool) -> dict:
 
     try:
         async with async_playwright() as p:
-            # Playwright beállítása 
             browser = await p.chromium.launch(headless=True)
             
-            # --- STEALTH MÓDOSÍTÁSOK ---
             context = await browser.new_context(
                 record_har_path=har_path if har_enabled else None,
-                # Új, realisztikusabb User-Agent
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-                # Asztali felbontás beállítása
                 viewport={'width': 1366, 'height': 768},
-                # Kiegészítő HTTP Headerek, hogy ne tűnjön botnak
                 extra_http_headers={
                     'Accept-Language': 'en-US,en;q=0.9,hu;q=0.8',
                     'DNT': '1', 
@@ -229,22 +199,15 @@ async def scrape_tubitv(url: str, har_enabled: bool) -> dict:
             
             page = await context.new_page()
 
-            # 🛑 JAVÍTÁS: Késleltetés növelése navigálás előtt (5 másodperc)
+            # Várakozási idők a botdetektálás megkerülésére (legutóbbi teszt)
             await page.wait_for_timeout(5000) 
             
-            # Navigálás és várakozás
             await page.goto(url, wait_until="networkidle", timeout=90000)
             
-            # 🛑 JAVÍTÁS: Kiegészítő várakozás a JavaScript futásának befejezésére (3 másodperc)
             await page.wait_for_timeout(3000) 
             
-            # --- STEALTH MÓDOSÍTÁSOK VÉGE ---
-            
-            # HTML kinyerése
             results['full_html'] = await page.content()
-            # ... ide jönne a console_logs és simple_network_log gyűjtés
             
-            # A HAR fájl lezárása
             await context.close()
             
             # HAR tartalom beolvasása, ha engedélyezve van
@@ -253,33 +216,36 @@ async def scrape_tubitv(url: str, har_enabled: bool) -> dict:
                     har_data = json.load(f)
                 results['har_log'] = har_data
                 
-                # Token kinyerése
-                access_token = extract_tubi_token_from_har(har_data)
-                results['tubi_token'] = access_token
-                
-                # --- KRITIKUS RÉSZ: BELSŐ API HÍVÁS ---
-                if access_token:
-                    device_id = extract_device_id_from_har(har_data)
+                # 🛑 KORREKCIÓ: CSAK AKKOR KERESSÜK A TUBI TOKENT, HA AZ URL TUBITV!
+                if "tubitv.com" in url: 
                     
-                    if device_id:
-                        logging.info("Token és Device ID sikeresen kinyerve. Indul a belső API hívás.")
+                    # Token kinyerése
+                    access_token = extract_tubi_token_from_har(har_data)
+                    results['tubi_token'] = access_token
+                    
+                    # --- KRITIKUS RÉSZ: BELSŐ API HÍVÁS ---
+                    if access_token:
+                        device_id = extract_device_id_from_har(har_data)
                         
-                        # Aszinkron futtatás
-                        loop = asyncio.get_event_loop()
-                        api_data = await loop.run_in_executor(
-                            None, 
-                            make_internal_tubi_api_call, 
-                            url, 
-                            access_token, 
-                            device_id
-                        )
+                        if device_id:
+                            logging.info("Token és Device ID sikeresen kinyerve. Indul a belső API hívás.")
+                            
+                            loop = asyncio.get_event_loop()
+                            api_data = await loop.run_in_executor(
+                                None, 
+                                make_internal_tubi_api_call, 
+                                url, 
+                                access_token, 
+                                device_id
+                            )
+                            
+                            results['tubi_api_data'] = api_data
+                            
+                        else:
+                            logging.warning("Nem sikerült kinyerni a Device ID-t. A belső API hívás kihagyva.")
+                else:
+                    logging.info(f"Skipping Tubi token check for non-Tubi URL: {url}")
                         
-                        results['tubi_api_data'] = api_data
-                        
-                    else:
-                        logging.warning("Nem sikerült kinyerni a Device ID-t. A belső API hívás kihagyva.")
-                        
-            # Visszaállítjuk a státuszt success-re, ha a scrape sikeres volt
             results['status'] = 'success'
             
     except Exception as e:
@@ -299,11 +265,10 @@ async def scrape_tubitv(url: str, har_enabled: bool) -> dict:
             
     return results
 
-# --- FLASK ROUTE ---
+# --- FLASK ROUTE (VÁLTOZATLAN) ---
 @app.route('/scrape', methods=['GET'])
 def scrape_endpoint():
     url = request.args.get('url')
-    # A 'target_api' is bekapcsolja a HAR logolást, ahogy a kliens is teszi
     har_enabled = request.args.get('har', 'false').lower() == 'true' or request.args.get('target_api', 'false').lower() == 'true'
 
     if not url:
@@ -312,11 +277,9 @@ def scrape_endpoint():
     logging.info(f"Kérés érkezett: {url}, HAR logolás: {har_enabled}")
     
     loop = asyncio.get_event_loop()
-    # Mivel a Flask egy szinkron környezet, ha már fut a loop, a nest_asyncio-val futtatjuk
     if loop.is_running():
         data = asyncio.run(scrape_tubitv(url, har_enabled))
     else:
-        # Ha a loop nem fut, elindítjuk
         data = loop.run_until_complete(scrape_tubitv(url, har_enabled))
     
     return jsonify(data)
