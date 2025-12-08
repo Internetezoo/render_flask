@@ -99,7 +99,7 @@ def extract_device_id_from_har(har_log: dict) -> str | None:
                         logging.info("Device ID sikeresen kinyerve a Set-Cookie-ból.")
                         return match.group(1).strip()
         
-        # 2. Keresés a Cookie fejlécben (kérés) - ÚJ ROBUSZTUSÍTÁS
+        # 2. Keresés a Cookie fejlécben (kérés)
         if 'request' in entry and 'headers' in entry['request']:
             for header in entry['request']['headers']:
                  if header.get('name', '').lower() == 'cookie':
@@ -134,6 +134,7 @@ def make_internal_tubi_api_call(search_url: str, access_token: str, device_id: s
     try:
         # A search term kinyerése az URL-ből
         parsed_url = urlparse(search_url)
+        # Az utolsó elem a search term, de URL-kódolt lehet
         search_term_encoded = parsed_url.path.split('/')[-1]
         
         # A full_api_url felépítése a template-ből
@@ -148,6 +149,7 @@ def make_internal_tubi_api_call(search_url: str, access_token: str, device_id: s
             'Content-Type': 'application/json',
             'Referer': 'https://tubitv.com/',
             'Origin': 'https://tubitv.com',
+            # EZ A HEADER KRITIKUS
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
             'Cookie': cookie_value, 
             'Authorization': f'Bearer {access_token}', # KRITIKUS FEJLÉC
@@ -174,7 +176,7 @@ def make_internal_tubi_api_call(search_url: str, access_token: str, device_id: s
         return {'api_call_status': 'failure', 'error': f'Unexpected Error: {e}'}
 
 
-# --- FŐ ASZINKRON SCRAPE FÜGGVÉNY ---
+# --- FŐ ASZINKRON SCRAPE FÜGGVÉNY (Stealth beállításokkal frissítve) ---
 async def scrape_tubitv(url: str, har_enabled: bool) -> dict:
     browser = None
     har_path = None
@@ -186,7 +188,7 @@ async def scrape_tubitv(url: str, har_enabled: bool) -> dict:
         'simple_network_log': [],
         'har_log': 'HAR log nem készült.',
         'tubi_token': None,
-        'tubi_api_data': None, # <-- ÚJ MEZŐ
+        'tubi_api_data': None, 
     }
     
     # Kinyeri a keresési szót, mert ez kell a Playwright logikájához
@@ -202,11 +204,27 @@ async def scrape_tubitv(url: str, har_enabled: bool) -> dict:
         async with async_playwright() as p:
             # Playwright beállítása 
             browser = await p.chromium.launch(headless=True)
+            
+            # --- STEALTH MÓDOSÍTÁSOK ---
             context = await browser.new_context(
                 record_har_path=har_path if har_enabled else None,
-                # További beállítások itt...
+                # Új, realisztikusabb User-Agent
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+                # Asztali felbontás beállítása
+                viewport={'width': 1366, 'height': 768},
+                # Kiegészítő HTTP Headerek, hogy ne tűnjön botnak
+                extra_http_headers={
+                    'Accept-Language': 'en-US,en;q=0.9,hu;q=0.8',
+                    'DNT': '1', # Do Not Track (a legtöbb böngésző alapból küldi)
+                    'Sec-Fetch-Site': 'same-origin',
+                }
             )
+            
             page = await context.new_page()
+
+            # Kisebb késleltetés hozzáadása, hogy élethűbb legyen a navigálás
+            await page.wait_for_timeout(2000) # 2 másodperc
+            # --- STEALTH MÓDOSÍTÁSOK VÉGE ---
 
             # Navigálás és várakozás
             await page.goto(url, wait_until="networkidle", timeout=90000)
@@ -235,12 +253,12 @@ async def scrape_tubitv(url: str, har_enabled: bool) -> dict:
                     if device_id:
                         logging.info("Token és Device ID sikeresen kinyerve. Indul a belső API hívás.")
                         
-                        # Aszinkron futtatás (Flask/asyncio környezetben elengedhetetlen a szinkron requests híváshoz)
+                        # Aszinkron futtatás
                         loop = asyncio.get_event_loop()
                         api_data = await loop.run_in_executor(
                             None, 
                             make_internal_tubi_api_call, 
-                            url, # Az eredeti keresési URL a keresési kifejezés kinyeréséhez
+                            url, 
                             access_token, 
                             device_id
                         )
@@ -283,9 +301,11 @@ def scrape_endpoint():
     logging.info(f"Kérés érkezett: {url}, HAR logolás: {har_enabled}")
     
     loop = asyncio.get_event_loop()
-    # A loop futtatja az aszinkron scrape_tubitv függvényt
-    data = loop.run_until_complete(scrape_tubitv(url, har_enabled))
+    # Mivel a Flask egy szinkron környezet, ha már fut a loop, a nest_asyncio-val futtatjuk
+    if loop.is_running():
+        data = asyncio.run(scrape_tubitv(url, har_enabled))
+    else:
+        # Ha a loop nem fut, elindítjuk
+        data = loop.run_until_complete(scrape_tubitv(url, har_enabled))
     
     return jsonify(data)
-
-# A többi Flask boilerplate (pl. 'if __name__ == "__main__":' vagy 'gunicorn' beállítások) ide jönne.
