@@ -1,115 +1,91 @@
-from flask import Flask, jsonify, request
-import asyncio
-from playwright.async_api import async_playwright
-import os
-import json
-import datetime 
+# app.py (RENDER.COM szerver)
 
-app = Flask(__name__)
-
-# A TUBI_API_BASE_URL_PATTERN-t most már csak a kliens script használja, de itt hagyhatjuk megjegyzésben.
-# TUBI_API_BASE_URL_PATTERN = "https://search.production-public.tubi.io/api/v2/search"
-
-# Bevezetjük a har_enabled kapcsolót
-async def scrape_website_with_network_log(url, har_enabled=False):
-    log_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
+async def scrape_website_with_network_log(url, har_enabled=False): # Változás itt: har_enabled bekerül
     results = {
         "url": url,
         "title": "",
         "full_html": "",
-        "har_log": "HAR log kérés szerint letiltva." if not har_enabled else "HAR log rögzítése folyamatban...",
-        "console_logs": [], 
-        "simple_network_log": [f"[{log_time}] --- Egyszerűsített Hálózati Log Indul ---"],
+        "har_log": "HAR log nem készült.",
         "status": "failure",
-        "error": "" 
+        "tubi_token": None, # <--- ÚJ: Token tárolása
+        "simple_network_log": [] # Simple log megmarad, ha használják
     }
     
-    har_path = None
-    context_options = {}
-
-    # HAR logolás konfigurálása csak akkor, ha engedélyezve van
-    if har_enabled:
-        har_path = f"/tmp/network_{os.getpid()}.har" 
-        context_options["record_har_path"] = har_path
+    har_path = f"/tmp/network_{os.getpid()}.har" 
 
     async with async_playwright() as p:
+        # ... browser beállítások ...
         browser = await p.chromium.launch(
             args=['--no-sandbox', '--disable-setuid-sandbox'] 
         )
         
-        # A context_options vagy üres, vagy tartalmazza a HAR rögzítési útvonalat
-        context = await browser.new_context(**context_options)
+        # A HAR rögzítést csak akkor kapcsoljuk be, ha kérjük
+        context = await browser.new_context(record_har_path=har_path if har_enabled else None)
         page = await context.new_page()
 
-        # Konzol és hálózati logolás (változatlan)
-        def log_console_message(msg):
-            results["console_logs"].append({"type": msg.type, "text": msg.text, "location": msg.location['url'] if msg.location else 'N/A'})
-        page.on("console", log_console_message)
-        def log_request(request):
-            log_entry = f"KÉRÉS | Típus: {request.resource_type:<10} | URL: {request.url}"
-            results["simple_network_log"].append(log_entry)
-        def log_response(response):
-            log_entry = f"VÁLASZ | Státusz: {response.status:<3} | URL: {response.url}"
-            results["simple_network_log"].append(log_entry)
-        page.on("request", log_request)
-        page.on("response", log_response)
+        # --- ÚJ: Hálózati Figyelő a Token Kinyerésére ---
+        async def handle_response(response):
+            # A Tubi hitelesítési API URL-jét figyeljük
+            if "account.production-public.tubi.io/device/anonymous/token" in response.url:
+                try:
+                    # Kinyerjük a választ (response body)
+                    response_text = await response.text()
+                    data = json.loads(response_text)
+                    if 'token' in data:
+                        # Mentjük a tokent a results dictionary-be
+                        results['tubi_token'] = data['token']
+                        print(f"Server Log: Tubi token found: {data['token'][:10]}...") 
+                except Exception as e:
+                    print(f"Server Log: Error parsing token response: {e}")
+            
+        page.on('response', handle_response)
+        # ----------------------------------------------------
 
         try:
-            results["simple_network_log"].append(f"Navigálás az oldalra: {url}")
-            
-            await page.goto(url, wait_until="networkidle", timeout=60000)
-            
-            results["simple_network_log"].append("A fő kérés (networkidle) befejeződött.")
-            
-            # Csak akkor várunk, ha a HAR engedélyezve van (a HAR logolási race condition elkerülése végett)
+            # 1. Navigáció és JS futtatás
+            await page.goto(url, wait_until="networkidle", timeout=60000) 
+            # ... többi logika ...
+
+            # 4. A rögzített HAR fájl tartalmának beolvasása (csak ha engedélyezve volt)
             if har_enabled:
-                await asyncio.sleep(2) 
-                results["simple_network_log"].append("2 másodpercnyi extra várakozás a HAR log teljességéért.")
-            
+                 # ... meglévő HAR beolvasási logika ...
+                 try:
+                    with open(har_path, 'r', encoding='utf-8') as f:
+                        results["har_log"] = json.load(f)
+                 except (FileNotFoundError, json.JSONDecodeError):
+                      results["har_log"] = "Hiba: HAR log fájl probléma."
+                 # ... meglévő tisztítás ...
+                 if os.path.exists(har_path):
+                     os.remove(har_path)
+
+            results["full_html"] = await page.content()
             results["title"] = await page.title()
-            results["full_html"] = await page.content() 
             results["status"] = "success"
 
         except Exception as e:
-            error_msg = f"Playwright hiba történt a navigáció során: {str(e)}"
-            results["error"] = error_msg
-            results["simple_network_log"].append(f"HIBA: {error_msg}")
-        
+            results["error"] = f"Playwright hiba: {str(e)}"
         finally:
+            # 3. Böngésző/Context bezárása
             await context.close()
             await browser.close()
-            
-            # HAR log beolvasása csak akkor, ha engedélyezve volt
-            if har_enabled and har_path:
-                try:
-                    with open(har_path, 'r', encoding='utf-8') as f:
-                        results["har_log"] = json.load(f)
-                except (FileNotFoundError, json.JSONDecodeError):
-                     results["har_log"] = "Hiba: HAR log nem készült vagy érvénytelen."
-                
-                # Tisztítás
-                if os.path.exists(har_path):
-                     os.remove(har_path)
-            
-            results["simple_network_log"].append("--- Egyszerűsített Hálózati Log Befejeződött ---")
             
     return results
 
 @app.route('/scrape', methods=['GET'])
 def run_scrape():
+    """Flask útvonal a scrape folyamat indításához."""
     target_url = request.args.get('url', 'https://example.com')
-    
-    # ÚJ: Megnézzük, hogy a 'har=true' paramétert elküldték-e
-    har_flag = request.args.get('har', 'false').lower() == 'true'
-    
-    try:
-        data = asyncio.run(scrape_website_with_network_log(target_url, har_flag))
-    except RuntimeError as e:
-        return jsonify({"status": "failure", "error": f"Aszinkron futási hiba: {str(e)}"}), 500
-    if data.get('status') == 'failure':
-         return jsonify(data), 500 
-    return jsonify(data)
+    # <--- ÚJ: har paraméter beolvasása, ami most már van a kliens kódunkban
+    har_enabled = request.args.get('har', 'false').lower() == 'true' 
 
-if __name__ == '__main__':
-    app.run(debug=True, port=os.environ.get('PORT', 5000))
+    try:
+        # Pass har_enabled to the async function
+        data = asyncio.run(scrape_website_with_network_log(target_url, har_enabled))
+    except RuntimeError as e:
+        return jsonify({
+            "status": "failure",
+            "error": f"Aszinkron futási hiba: {str(e)}"
+        }), 500
+    
+    # ... meglévő logikák ...
+    return jsonify(data)
