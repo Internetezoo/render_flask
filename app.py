@@ -1,13 +1,14 @@
 from flask import Flask, jsonify, request
 import asyncio
-from playwright.async_api import async_playwright, TimeoutError 
+# VISSZAÁLLÍTVA: TimeoutError importálását kivettük, hogy elkerüljük az 'Page' hiba miatti összeomlást
+from playwright.async_api import async_playwright
 import os
 import json
 import datetime 
 
 app = Flask(__name__)
 
-# KRITIKUS KONSTANS: A Tubi API alap URL-je
+# A kliens scriptben továbbra is szükség van erre a mintára a kereséshez, de a szerveroldali kód most nem használja.
 TUBI_API_BASE_URL_PATTERN = "https://search.production-public.tubi.io/api/v2/search"
 
 async def scrape_website_with_network_log(url):
@@ -33,7 +34,7 @@ async def scrape_website_with_network_log(url):
         context = await browser.new_context(record_har_path=har_path)
         page = await context.new_page()
 
-        # Konzol és hálózati logolás
+        # Konzol és hálózati logolás (változatlan)
         def log_console_message(msg):
             results["console_logs"].append({
                 "type": msg.type,
@@ -56,23 +57,20 @@ async def scrape_website_with_network_log(url):
         try:
             results["simple_network_log"].append(f"Navigálás az oldalra: {url}")
             
-            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            # Visszatérés a networkidle-höz, ami a legtöbb esetben befejezi a kérést.
+            await page.goto(url, wait_until="networkidle", timeout=60000)
             
-            results["simple_network_log"].append("DomContentLoaded állapot elérve. Várakozás a Tubi API válaszára.")
+            results["simple_network_log"].append("A fő kérés (networkidle) befejeződött.")
             
-            # Explicit várakozás a kulcsfontosságú Tubi API válaszára
-            await page.wait_for_response(TUBI_API_BASE_URL_PATTERN, timeout=30000) 
-            
-            results["simple_network_log"].append(f"✅ Tubi API válasz megérkezett: {TUBI_API_BASE_URL_PATTERN}")
+            # KRITIKUS JAVÍTÁS: Explicit várakozás 2 másodpercig. 
+            # Ez a várakozás biztosítja, hogy a Tubi API válasza bekerüljön a HAR logba, mielőtt lezárnánk.
+            await asyncio.sleep(2) 
+            results["simple_network_log"].append("2 másodpercnyi extra várakozás a HAR log teljességéért.")
             
             results["title"] = await page.title()
             results["full_html"] = await page.content() 
             results["status"] = "success"
 
-        except TimeoutError:
-            error_msg = f"Időtúllépés: A Tubi kereső API hívása ({TUBI_API_BASE_URL_PATTERN}) nem érkezett meg 30 másodperc alatt."
-            results["error"] = error_msg
-            results["simple_network_log"].append(f"HIBA: {error_msg}")
         except Exception as e:
             error_msg = f"Playwright hiba történt a navigáció során: {str(e)}"
             results["error"] = error_msg
