@@ -2,19 +2,20 @@ import asyncio
 import nest_asyncio
 import json
 import logging
-import base64 # Szükséges a Base64 dekódoláshoz, ha a HAR log úgy tárolja a válasz tartalmát
+import base64
+import tempfile  # ÚJ: Ideiglenes fájlok kezeléséhez
+import os        # ÚJ: Fájlrendszer műveletekhez (törlés)
 from flask import Flask, request, jsonify
 from playwright.async_api import async_playwright
 
-# Engedélyezi az aszinkron funkciók beágyazását (szükséges a Gunicorn + Playwright async használatához)
+# Engedélyezi az aszinkron funkciók beágyazását
 nest_asyncio.apply()
 
 app = Flask(__name__)
-# Csökkenti a JSON válasz méretét, ami gyorsítja az átvitelt
 app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
 logging.basicConfig(level=logging.INFO)
 
-# --- SEGÉDFÜGGVÉNY A TOKEN KINYERÉSÉRE (SZERVER OLDALON) ---
+# --- SEGÉDFÜGGVÉNY A TOKEN KINYERÉSÉRE ---
 def extract_tubi_token_from_har(har_data: dict) -> str | None:
     """Kinyeri az access_token-t a Tubi TV HAR logjából a 'device/anonymous/token' válaszából."""
     TUBI_TOKEN_ENDPOINT = "account.production-public.tubi.io/device/anonymous/token"
@@ -28,8 +29,6 @@ def extract_tubi_token_from_har(har_data: dict) -> str | None:
             
             # 1. Megkeresi a token lekérő kérést
             if TUBI_TOKEN_ENDPOINT in url:
-                
-                # 2. Megvizsgálja a válasz tartalmát (content)
                 response_content = entry['response']['content']
                 
                 if response_content and 'text' in response_content:
@@ -54,7 +53,7 @@ def extract_tubi_token_from_har(har_data: dict) -> str | None:
                             return access_token
                             
                     except json.JSONDecodeError:
-                        logging.warning(f"Nem érvényes JSON válasz a token endpoint-ról.")
+                        logging.warning("Nem érvényes JSON válasz a token endpoint-ról.")
                         continue
                         
         return None
@@ -73,34 +72,32 @@ async def scrape_website_with_network_log(url: str, har_enabled: bool = False, r
         'console_logs': [],
         'simple_network_log': [],
         'har_log': None,
-        'tubi_token': None, # Ez lesz a szerver által kinyert token
+        'tubi_token': None,
     }
     
-    # HAR logolás mindenképp szükséges, ha a token kinyerése a cél
-    if not har_enabled:
-        # Ha a HAR-t nem kérte a kliens, de a token kell, a belső logolást bekapcsoljuk
-        # A Flask route-ban a 'har' paramétert használjuk ennek eldöntésére
-        pass # A Flask route-ban kezeljük, de itt a har_enabled jelzi, hogy mi történik
+    har_path = None # Ideiglenes fájl útvonala
+    browser = None
     
-    
-    browser = None # Inicializálás a finally blokk számára
     try:
         async with async_playwright() as p:
-            # Csak a Chromium kell a Playwright install chromium miatt
             browser = await p.chromium.launch() 
-            
-            # Context létrehozása HAR logolással, ha engedélyezve van
-            context = await browser.new_context(
-                record_har_mode='full' if har_enabled else None,
-                # Fontos: omit_content=False, hogy a válasz testét is rögzítse
-                record_har_omit_content=False if har_enabled else True, 
-            )
+
+            context_options = {}
             if har_enabled:
-                logging.info("HAR logolás engedélyezve.")
+                # Létrehozunk egy ideiglenes fájlnevet a HAR log számára
+                temp_file = tempfile.NamedTemporaryFile(suffix=".har", delete=False)
+                har_path = temp_file.name
+                temp_file.close() # Fontos: lezárjuk a fájlt, hogy a Playwright tudjon bele írni
+
+                context_options['record_har_path'] = har_path
+                # A 'full' mód itt már nem szükséges, ha a path-ot megadjuk
+                context_options['record_har_omit_content'] = False 
                 
-            page = await context.new_page()
+                logging.info(f"HAR logolás engedélyezve, mentés ideiglenes fájlba: {har_path}")
+
+            # Context létrehozása a HAR logolási opciókkal
+            context = await browser.new_context(**context_options)
             
-            # ... (Hálózati logok és Konzol logok gyűjtése logikája) ...
             simple_network_log = []
             page.on("request", lambda request: simple_network_log.append(f"KÉRÉS | Típus: {request.resource_type:<10} | URL: {request.url}"))
             page.on("response", lambda response: simple_network_log.append(f"VÁLASZ | Státusz: {response.status:<3} | URL: {response.url}"))
@@ -112,33 +109,42 @@ async def scrape_website_with_network_log(url: str, har_enabled: bool = False, r
                 'location': msg.location['url'] if msg.location and 'url' in msg.location else 'N/A'
             }))
             
-            # Navigálás: 45mp-re emelve a Gunicorn timeout miatt
+            page = await context.new_page()
+
+            # Navigálás
             await page.goto(url, wait_until='domcontentloaded', timeout=45000) 
-            await asyncio.sleep(1.5) # Várakozás a dinamikus betöltésre
+            await asyncio.sleep(1.5)
 
             results['full_html'] = await page.content()
             results['console_logs'] = console_logs
             results['simple_network_log'] = simple_network_log
             results['status'] = 'success'
 
-            # --- SZERVER OLDALI FELDOLGOZÁS ---
-            if har_enabled:
-                har_log = await context.har() 
+            # --- SZERVER OLDALI FELDOLGOZÁS (ÚJ LOGIKA) ---
+            if har_enabled and har_path:
+                har_log = None
                 
-                # 1. Token kinyerése
-                token = extract_tubi_token_from_har(har_log)
-                if token:
-                    results['tubi_token'] = token
-                    logging.info("Tubi token sikeresen kinyerve a szerveren.")
-                
-                # 2. HAR log feltöltése a válaszba, ha a kliens KÉRTE ('har' paraméter = true)
-                # A request_args-ot a Flask route-ból kapjuk meg
-                if request_args and request_args.get('har', 'false').lower() == 'true':
-                    results['har_log'] = har_log
-                    logging.info("HAR log visszaküldve a kliens kérésére.")
-                else:
-                    # Sávszélesség spórolás: ha a token megvan és nem kérték a HAR-t, nem küldjük el
-                    logging.info("HAR log elhagyva a válaszból (optimalizáció).")
+                # 1. HAR log tartalmának beolvasása az ideiglenes fájlból
+                try:
+                    with open(har_path, 'r', encoding='utf-8') as f:
+                        har_log = json.load(f)
+                    
+                    # 2. Token kinyerése a memóriában lévő HAR logból
+                    token = extract_tubi_token_from_har(har_log)
+                    if token:
+                        results['tubi_token'] = token
+                        logging.info("Tubi token sikeresen kinyerve a szerveren.")
+                    
+                    # 3. HAR log feltöltése a válaszba, ha a kliens KÉRTE
+                    if request_args and request_args.get('har', 'false').lower() == 'true':
+                        results['har_log'] = har_log
+                        logging.info("HAR log visszaküldve a kliens kérésére.")
+                    else:
+                        logging.info("HAR log elhagyva a válaszból (optimalizáció).")
+
+                except Exception as file_e:
+                    logging.error(f"Hiba a HAR fájl olvasásakor/elemzésekor: {file_e}")
+                    results['error'] = results.get('error', '') + f" (HAR feldolgozási hiba: {file_e})"
 
 
     except Exception as e:
@@ -149,14 +155,22 @@ async def scrape_website_with_network_log(url: str, har_enabled: bool = False, r
     finally:
         if browser:
             await browser.close()
+        # Végül töröljük az ideiglenes fájlt!
+        if har_path and os.path.exists(har_path):
+            try:
+                os.remove(har_path)
+                logging.info(f"Ideiglenes HAR fájl törölve: {har_path}")
+            except Exception as remove_e:
+                # Ezt a hibát nem küldjük vissza, csak logoljuk
+                logging.warning(f"Nem sikerült törölni az ideiglenes fájlt: {har_path}. Hiba: {remove_e}")
             
     return results
 
-# --- FLASK ROUTE (JAVÍTVA) ---
+# --- FLASK ROUTE (VÁLTOZATLAN) ---
 @app.route('/scrape', methods=['GET'])
 def scrape_endpoint():
     url = request.args.get('url')
-    # A HAR logolás engedélyezése szükséges a szerver oldali kinyeréshez
+    # A HAR logolás engedélyezése szükséges a szerver oldali kinyeréshez VAGY ha a kliens explicit kéri a har paraméterrel
     har_enabled = request.args.get('har', 'false').lower() == 'true' or request.args.get('target_api', 'false').lower() == 'true'
 
     if not url:
@@ -176,5 +190,4 @@ def scrape_endpoint():
     return jsonify(data)
 
 if __name__ == '__main__':
-    # Helyi teszteléshez
     app.run(host='0.0.0.0', port=5000, debug=True)
