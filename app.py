@@ -16,7 +16,6 @@ app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
 logging.basicConfig(level=logging.INFO)
 
 # --- SEGÉDFÜGGVÉNY A TOKEN KINYERÉSÉRE ---
-# (Változatlan a korábbi fixhez képest)
 def extract_tubi_token_from_har(har_data: dict) -> str | None:
     """Kinyeri az access_token-t a Tubi TV HAR logjából a 'device/anonymous/token' válaszából."""
     TUBI_TOKEN_ENDPOINT = "account.production-public.tubi.io/device/anonymous/token"
@@ -89,13 +88,9 @@ async def scrape_website_with_network_log(url: str, har_enabled: bool = False, r
                 
                 logging.info(f"HAR logolás engedélyezve, mentés ideiglenes fájlba: {har_path}")
 
-            # Context létrehozása a HAR logolási opciókkal
             context = await browser.new_context(**context_options)
-            
-            # --- JAVÍTVA: A 'page' OBJEKTUM LÉTREHOZÁSA AZONNAL ---
             page = await context.new_page() 
             
-            # --- JAVÍTVA: ESEMÉNYKEZELŐK RÖGZÍTÉSE MÁR A LÉTREHOZOTT 'page' OBJEKTUMRA ---
             simple_network_log = []
             page.on("request", lambda request: simple_network_log.append(f"KÉRÉS | Típus: {request.resource_type:<10} | URL: {request.url}"))
             page.on("response", lambda response: simple_network_log.append(f"VÁLASZ | Státusz: {response.status:<3} | URL: {response.url}"))
@@ -106,8 +101,7 @@ async def scrape_website_with_network_log(url: str, har_enabled: bool = False, r
                 'text': msg.text, 
                 'location': msg.location['url'] if msg.location and 'url' in msg.location else 'N/A'
             }))
-            # --------------------------------------------------------------------------------
-
+            
             # Navigálás
             await page.goto(url, wait_until='domcontentloaded', timeout=45000) 
             await asyncio.sleep(1.5)
@@ -119,16 +113,27 @@ async def scrape_website_with_network_log(url: str, har_enabled: bool = False, r
 
             # --- SZERVER OLDALI FELDOLGOZÁS ---
             if har_enabled and har_path:
-                # ... (A HAR fájl beolvasása és token kinyerés logikája változatlan) ...
+                
+                # KULCSFONTOSSÁGÚ JAVÍTÁS: Kontextus lezárása a HAR log fájlba írásának befejezéséhez.
+                await context.close()
+                logging.info("BrowserContext lezárva, HAR log kiírása befejezve.")
+                
+                har_log = None
+                
+                # HAR log tartalmának beolvasása az ideiglenes fájlból
                 try:
                     with open(har_path, 'r', encoding='utf-8') as f:
                         har_log = json.load(f)
                     
+                    # Token kinyerése a memóriában lévő HAR logból
                     token = extract_tubi_token_from_har(har_log)
                     if token:
                         results['tubi_token'] = token
                         logging.info("Tubi token sikeresen kinyerve a szerveren.")
+                    else:
+                        logging.warning("Nem sikerült kinyerni a Tubi tokent a HAR logból.")
                     
+                    # HAR log feltöltése a válaszba, ha a kliens KÉRTE
                     if request_args and request_args.get('har', 'false').lower() == 'true':
                         results['har_log'] = har_log
                         logging.info("HAR log visszaküldve a kliens kérésére.")
@@ -136,6 +141,7 @@ async def scrape_website_with_network_log(url: str, har_enabled: bool = False, r
                         logging.info("HAR log elhagyva a válaszból (optimalizáció).")
 
                 except Exception as file_e:
+                    # Ez a hiba volt a "Expecting value..." JSON hiba
                     logging.error(f"Hiba a HAR fájl olvasásakor/elemzésekor: {file_e}")
                     results['error'] = results.get('error', '') + f" (HAR feldolgozási hiba: {file_e})"
 
@@ -146,8 +152,11 @@ async def scrape_website_with_network_log(url: str, har_enabled: bool = False, r
         logging.error(f"Scraping hiba: {e}")
         
     finally:
+        # A böngésző bezárása (ez implicit módon bezárja a kontextust is, 
+        # de a fenti explicit close() kellett a fájl írásának befejezéséhez)
         if browser:
             await browser.close()
+            
         # Végül töröljük az ideiglenes fájlt!
         if har_path and os.path.exists(har_path):
             try:
