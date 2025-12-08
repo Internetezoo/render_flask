@@ -7,10 +7,10 @@ import tempfile
 import os        
 from flask import Flask, request, jsonify
 from playwright.async_api import async_playwright
-import requests # <-- ÚJ IMPORT
-import re       # <-- ÚJ IMPORT
-from urllib.parse import urlparse, parse_qs, unquote # <-- ÚJ IMPORT
-from typing import Optional, Dict # <-- ÚJ IMPORT
+import requests
+import re      
+from urllib.parse import urlparse, parse_qs, unquote
+from typing import Optional, Dict
 
 # Engedélyezi az aszinkron funkciók beágyazását
 nest_asyncio.apply()
@@ -19,7 +19,7 @@ app = Flask(__name__)
 app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
 logging.basicConfig(level=logging.INFO)
 
-# Tubi API URL TEMPLATE (A flask_client.py-ból áthozva)
+# Tubi API URL TEMPLATE
 TUBI_API_TEMPLATE = (
     "https://search.production-public.tubi.io/api/v2/search?"
     "images%5Bposterarts%5D=w408h583_poster&images%5Bhero_422%5D=w422h360_hero&"
@@ -30,9 +30,12 @@ TUBI_API_TEMPLATE = (
     "search={search_term}&include_channels=true&include_linear=true&is_kids_mode=false"
 )
 
-# --- SEGÉDFÜGGVÉNY A TOKEN KINYERÉSÉRE (Változatlan, de a teljesítéshez be kell venni) ---
+# --- JAVÍTOTT SEGÉDFÜGGVÉNY: TOKEN KINYERÉSE ---
 def extract_tubi_token_from_har(har_data: dict) -> str | None:
-    """Kinyeri az access_token-t a Tubi TV HAR logjából a 'device/anonymous/token' válaszából."""
+    """
+    Kinyeri az access_token-t a Tubi TV HAR logjából a 'device/anonymous/token' válaszából,
+    vagy az 'Authorization' fejlécből.
+    """
     TUBI_TOKEN_ENDPOINT = "account.production-public.tubi.io/device/anonymous/token"
     
     if not har_data or not isinstance(har_data, dict) or 'log' not in har_data:
@@ -40,11 +43,10 @@ def extract_tubi_token_from_har(har_data: dict) -> str | None:
         
     try:
         for entry in har_data['log']['entries']:
+            # 1. Access Token keresése a 'device/anonymous/token' válaszában
             url = entry['request']['url']
-            
             if TUBI_TOKEN_ENDPOINT in url:
                 response_content = entry['response']['content']
-                
                 if response_content and 'text' in response_content:
                     response_text = response_content['text']
                     
@@ -52,39 +54,61 @@ def extract_tubi_token_from_har(har_data: dict) -> str | None:
                         try:
                              response_text = base64.b64decode(response_text).decode('utf-8')
                         except:
-                            logging.error("Base64 dekódolási hiba a token kinyerésekor.")
                             continue
                             
                     try:
                         token_data = json.loads(response_text)
                         if 'access_token' in token_data:
-                            logging.info("Tubi access token sikeresen kinyerve a HAR logból.")
+                            logging.info("Tubi access token sikeresen kinyerve a VÁLASZBÓL.")
                             return token_data['access_token']
                     except json.JSONDecodeError:
-                        logging.warning("JSON dekódolási hiba a token válaszban.")
                         continue
                         
+            # 2. Access Token keresése az Authorization fejlécben (Robusztusabb módszer)
+            if 'request' in entry and 'headers' in entry['request']:
+                for header in entry['request']['headers']:
+                    if header.get('name', '').lower() == 'authorization':
+                        value = header.get('value', '')
+                        if value.startswith('Bearer '):
+                            logging.info("Tubi access token sikeresen kinyerve a KÉRÉS FEJLÉCBŐL.")
+                            return value.split('Bearer ')[1].strip()
+
+        logging.warning("Nem találtam Tubi access tokent a HAR logban.")
         return None
     except Exception as e:
         logging.error(f"Hiba a Tubi token kinyerésekor: {e}")
         return None
 
 
-# --- ÚJ SEGÉDFÜGGVÉNY: Device ID kinyerése a HAR logból (A flask_client.py-ból áthozva) ---
+# --- JAVÍTOTT SEGÉDFÜGGVÉNY: Device ID kinyerése ---
 def extract_device_id_from_har(har_log: dict) -> str | None:
-    """Kinyeri a friss 'deviceId' cookie-t a HAR logból."""
+    """
+    Kinyeri a friss 'deviceId' cookie-t a HAR logból.
+    Keresi a Set-Cookie fejlécben (válasz), a Cookie fejlécben (kérés) és a POST törzsben.
+    """
     if not har_log or 'entries' not in har_log.get('log', {}):
         return None
 
     for entry in har_log['log']['entries']:
+        # 1. Keresés a Set-Cookie fejlécben (válasz)
         if 'response' in entry and 'headers' in entry['response']:
             for header in entry['response']['headers']:
                 if header.get('name', '').lower() == 'set-cookie':
                     match = re.search(r'deviceId=([^;]+)', header.get('value', ''))
                     if match:
+                        logging.info("Device ID sikeresen kinyerve a Set-Cookie-ból.")
                         return match.group(1).strip()
-    
-    for entry in har_log['log']['entries']:
+        
+        # 2. Keresés a Cookie fejlécben (kérés) - ÚJ ROBUSZTUSÍTÁS
+        if 'request' in entry and 'headers' in entry['request']:
+            for header in entry['request']['headers']:
+                 if header.get('name', '').lower() == 'cookie':
+                     match = re.search(r'deviceId=([^;]+)', header.get('value', ''))
+                     if match:
+                         logging.info("Device ID sikeresen kinyerve a Cookie fejlécből.")
+                         return match.group(1).strip()
+
+        # 3. Keresés a POST kérések törzsében
         if 'request' in entry and entry['request'].get('method') == 'POST':
              if '/device/anonymous/' in entry['request'].get('url', ''):
                  post_data = entry['request'].get('postData', {}).get('text')
@@ -92,12 +116,15 @@ def extract_device_id_from_har(har_log: dict) -> str | None:
                      try:
                          data_obj = json.loads(post_data)
                          if 'device_id' in data_obj:
+                             logging.info("Device ID sikeresen kinyerve a POST törzsből.")
                              return data_obj['device_id'].strip()
                      except:
                          pass
+                         
+    logging.warning("Nem találtam Device ID-t a HAR logban.")
     return None
 
-# --- ÚJ FÜGGVÉNY: Tubi API hívás a Render szerveren belül (A kért geo-megoldás!) ---
+# --- ÚJ FÜGGVÉNY: Tubi API hívás a Render szerveren belül ---
 def make_internal_tubi_api_call(search_url: str, access_token: str, device_id: str) -> dict | None:
     """
     Belső Tubi API hívást hajt végre a Render szerveren lévő tokenekkel.
@@ -112,7 +139,7 @@ def make_internal_tubi_api_call(search_url: str, access_token: str, device_id: s
         # A full_api_url felépítése a template-ből
         full_api_url = TUBI_API_TEMPLATE.format(search_term=search_term_encoded)
         
-        # Headerek összeállítása (a korábban javított, működő fejlécek)
+        # Headerek összeállítása
         cookie_value = f'deviceId={device_id}; at={access_token}'
         
         headers = {
@@ -136,7 +163,6 @@ def make_internal_tubi_api_call(search_url: str, access_token: str, device_id: s
         return response.json()
         
     except requests.exceptions.HTTPError as e:
-        # Hiba esetén is megpróbáljuk visszaadni a választ, ha van
         response_data = {'api_call_status': 'failure', 'error': f'HTTP Error {response.status_code}', 'api_response_text': response.text[:200]}
         logging.error(f"Belső Tubi API HTTP Hiba: Státusz {response.status_code}. Részletek: {e}")
         return response_data
@@ -148,8 +174,7 @@ def make_internal_tubi_api_call(search_url: str, access_token: str, device_id: s
         return {'api_call_status': 'failure', 'error': f'Unexpected Error: {e}'}
 
 
-# --- FRISSÍTETT FŐ ASZINKRON SCRAPE FÜGGVÉNY ---
-# Csak a releváns részek frissülnek (a Playwright logolás utáni rész)
+# --- FŐ ASZINKRON SCRAPE FÜGGVÉNY ---
 async def scrape_tubitv(url: str, har_enabled: bool) -> dict:
     browser = None
     har_path = None
@@ -175,7 +200,7 @@ async def scrape_tubitv(url: str, har_enabled: bool) -> dict:
 
     try:
         async with async_playwright() as p:
-            # Playwright beállítása (ugyanaz, mint a snippetben)
+            # Playwright beállítása 
             browser = await p.chromium.launch(headless=True)
             context = await browser.new_context(
                 record_har_path=har_path if har_enabled else None,
@@ -186,7 +211,7 @@ async def scrape_tubitv(url: str, har_enabled: bool) -> dict:
             # Navigálás és várakozás
             await page.goto(url, wait_until="networkidle", timeout=90000)
             
-            # HTML és logok kinyerése (ugyanaz, mint a snippetben)
+            # HTML kinyerése
             results['full_html'] = await page.content()
             # ... ide jönne a console_logs és simple_network_log gyűjtés
             
@@ -245,7 +270,7 @@ async def scrape_tubitv(url: str, har_enabled: bool) -> dict:
             
     return results
 
-# --- FLASK ROUTE (VÁLTOZATLAN) ---
+# --- FLASK ROUTE ---
 @app.route('/scrape', methods=['GET'])
 def scrape_endpoint():
     url = request.args.get('url')
