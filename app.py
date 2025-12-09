@@ -43,7 +43,7 @@ def decode_jwt_payload(jwt_token: str) -> Optional[str]:
     try:
         payload_base64 = jwt_token.split('.')[1]
         padding = '=' * (4 - len(payload_base64) % 4)
-        payload_decoded = base64.b64decode(payload_base64 + padding).decode('utf-8')
+        payload_decoded = base64.b64bdecode(payload_base64 + padding).decode('utf-8')
         
         payload_data = json.loads(payload_decoded)
         return payload_data.get('device_id')
@@ -152,9 +152,14 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, html_enabled: bool, 
                 page.on('console', lambda msg: results['console_logs'].append({'type': msg.type, 'text': msg.text}))
                 page.on('pageerror', lambda error: results['console_logs'].append({'type': 'error', 'text': str(error)}))
             
+            # --- Javítás: Áttérés standard aszinkron függvényre a lambda helyett ---
+            async def abort_requests(route):
+                await route.abort()
+                
             # Hálózati forgalom blokkolása (minden esetben a gyorsabb betöltésért)
-            await page.route("**/google-analytics**", lambda route: route.abort())
-            await page.route(lambda url: url.lower().endswith(('.png', '.jpg', '.gif', '.css', '.woff2')), lambda route: route.abort())
+            await page.route("**/google-analytics**", abort_requests)
+            await page.route(lambda url: url.lower().endswith(('.png', '.jpg', '.gif', '.css', '.woff2')), abort_requests)
+            # ---------------------------------------------------------------------
             
             # --- MÓDOSÍTOTT LOGIKA: CSAK AKKOR KELL AZ ÉLŐFOGÁS, HA 'target_api' IS FUT ---
             if target_api_enabled:
