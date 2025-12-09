@@ -9,7 +9,7 @@ from flask import Flask, request, jsonify
 from playwright.async_api import async_playwright, Route
 import requests
 import re      
-import urllib.parse # <--- JAVÍTVA: Hozzáadva a NameError miatt
+import urllib.parse # FIX 1 (NameError javítása)
 from urllib.parse import urlparse, parse_qs, unquote
 from typing import Optional, Dict
 
@@ -18,6 +18,7 @@ nest_asyncio.apply()
 
 app = Flask(__name__)
 app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
+# JAVÍTÁS A: Átállítva DEBUG szintre a részletes hálózati logokhoz
 logging.basicConfig(level=logging.DEBUG)
 
 # --- KONFIGURÁCIÓS ÁLLANDÓK ---
@@ -48,7 +49,8 @@ def decode_jwt_payload(jwt_token: str) -> Optional[str]:
         
         payload_data = json.loads(payload_decoded)
         return payload_data.get('device_id')
-    except Exception:
+    except Exception as e:
+        logging.debug(f"Hiba a JWT dekódolásánál: {e}")
         return None
 
 def make_internal_tubi_api_call(search_term: str, token: str, device_id: str, user_agent: str) -> Optional[Dict]:
@@ -58,7 +60,7 @@ def make_internal_tubi_api_call(search_term: str, token: str, device_id: str, us
         return None
 
     # Összeállítjuk a teljes Tubi API URL-t
-    encoded_search_term = urllib.parse.quote(search_term) # JAVÍTVA: urllib.parse
+    encoded_search_term = urllib.parse.quote(search_term) 
     full_api_url = f"{TUBI_API_TEMPLATE}{encoded_search_term}"
 
     # Összeállítjuk a fejléceket
@@ -114,6 +116,11 @@ async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
             # Eseménykezelő a token és Device ID élő rögzítéséhez
             async def handle_request_for_token(route: Route):
                 request = route.request
+                
+                # JAVÍTÁS B: Hálózati forgalom logolása (DEBUG)
+                if 'tubi' in request.url.lower() or 'device' in request.url.lower():
+                     logging.debug(f"🔍 [HÁLÓZAT KÉRÉS] {request.method} - URL: {request.url}")
+                
                 headers = request.headers
                 
                 # --- 1. Ellenőrzés a KÉRÉS fejlécében ---
@@ -208,8 +215,7 @@ def scrape_tubi_endpoint():
     if not url:
         return jsonify({'status': 'failure', 'error': 'Hiányzó "url" paraméter.'}), 400
     
-    # A 'target_api' paraméter itt 'true' kell, hogy legyen!
-    target_api_enabled = request.args.get('target_api', '').lower() == 'true' 
+    target_api_enabled = request.args.get('target_api', '').lower() == 'true'
     
     logging.info(f"API hívás indítása. Cél URL: {url}. Belső API hívás engedélyezve: {target_api_enabled}.")
 
