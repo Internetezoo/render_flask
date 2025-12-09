@@ -25,16 +25,20 @@ logging.basicConfig(level=logging.DEBUG)
 MAX_RETRIES = 3 # Maximum ennyi újrapróbálkozás a token megszerzésére
 DEVICE_ID_HEADER = "X-Tubi-Client-Device-ID"
 
-# Tubi API URL TEMPLATE (MÓDOSÍTVA: search= paraméter előrébb hozva a sorrend miatt)
-TUBI_API_TEMPLATE = (
+# 1. Tubi API URL TEMPLATE ELŐTAGJA: Ez a rész a search= paramétert tartalmazza
+TUBI_API_TEMPLATE_PREFIX = (
     "https://search.production-public.tubi.io/api/v2/search?"
     "images%5Bposterarts%5D=w408h583_poster&images%5Bhero_422%5D=w422h360_hero&"
     "images%5Bhero_feature_desktop_tablet%5D=w1920h768_hero&images%5Bhero_feature_large_mobile%5D=w960h480_hero&"
     "images%5Bhero_feature_small_mobile%5D=w540h450_hero&images%5Bhero_feature%5D=w375h355_hero&"
     "images%5Blandscape_images%5D=w978h549_landscape&images%5Blinear_larger_poster%5D=w978h549_landscape&"
     "images%5Bbackgrounds%5D=w1614h906_background&images%5Btitle_art%5D=w430h180_title&"
-    "search=" # A KÉRT HELYEN
-    "&include_channels=true&include_linear=true&is_kids_mode=false" # & hozzáadva és a többi paraméter
+    "search=" # Itt van a search kulcs. A keresési kifejezés ide kerül.
+)
+
+# 2. Tubi API URL TEMPLATE UTÓTAGJA: Ez a search paraméter utáni rész
+TUBI_API_TEMPLATE_SUFFIX = (
+    "&include_channels=true&include_linear=true&is_kids_mode=false"
 )
 
 # ----------------------------------------------------------------------
@@ -62,10 +66,9 @@ def make_internal_tubi_api_call(search_term: str, token: str, device_id: str, us
 
     # Összeállítjuk a teljes Tubi API URL-t
     encoded_search_term = urllib.parse.quote(search_term) 
-    # A TUBI_API_TEMPLATE most már a "search=" -ben végződik, de ott is folytatódik a &include_channels-el.
-    # Azért, hogy a Python kódban a logikát ne kelljen szétszedni, a f-string-ben egyszerűen a végére illesztjük a keresést.
-    # Ezzel: ...images%5Btitle_art%5D=w430h180_title&search=Police%20Woman&include_channels=true...
-    full_api_url = f"{TUBI_API_TEMPLATE}{encoded_search_term}"
+    
+    # ÚJ, HELYES ÖSSZEÁLLÍTÁS (Előtag + Keresési kifejezés + Utótag)
+    full_api_url = f"{TUBI_API_TEMPLATE_PREFIX}{encoded_search_term}{TUBI_API_TEMPLATE_SUFFIX}"
 
     # Összeállítjuk a fejléceket
     request_headers = {
@@ -81,6 +84,7 @@ def make_internal_tubi_api_call(search_term: str, token: str, device_id: str, us
         response.raise_for_status() 
         return response.json()
     except requests.exceptions.RequestException as e:
+        # Itt van a hiba, ami miatt a PROXY a konzolon hibát írt ki (500)
         logging.error(f"Belső API hívási hiba: {e}")
         return None
 
@@ -172,7 +176,7 @@ async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
             logging.info("🌐 Oldal betöltése (wait_until='networkidle')...")
             await page.goto(url, wait_until="networkidle", timeout=30000) 
             
-            # NÖVELT VÁRAKOZÁS: Több időt adunk a késleltetett token generáló kérésnek (2000 -> 5000ms)
+            # NÖVELT VÁRAKOZÁS: Több időt adunk a késleltetett token generáló kérésnek
             logging.info("⏳ Kényszerített várakozás 5 másodperc a token rögzítésére.")
             await page.wait_for_timeout(5000) 
 
@@ -193,7 +197,7 @@ async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
                     results['tubi_device_id'] = device_id_from_token
                     logging.info("📱 Device ID kinyerve a token payloadból (Fallback).")
 
-            # 4. Belső API hívás
+            # 4. Belső API hívás (CSAK ITT TÖRTÉNIK A search_term KINYERÉSE ÉS A VÉGLEGES API HÍVÁS)
             if target_api_enabled and results['tubi_token'] and results['tubi_device_id']:
                 # search_term kinyerése az URL-ből
                 url_parsed = urlparse(url)
@@ -214,7 +218,9 @@ async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
                 if search_term:
                     tubi_api_data = make_internal_tubi_api_call(search_term, results['tubi_token'], results['tubi_device_id'], results['user_agent'])
                     results['tubi_api_data'] = tubi_api_data
+                    
                     if not tubi_api_data:
+                        # Ez a blokk fog lefutni az 500-as hiba esetén
                         results['status'] = 'failure'
                         results['error'] = 'Sikertelen belső Tubi API hívás a kinyert tokennel.'
                 else:
@@ -248,11 +254,18 @@ def scrape_tubi_endpoint():
         final_data = loop.run_until_complete(scrape_tubitv(url, target_api_enabled))
         
         # 1. Sikeres Kimenet VAGY Technikai hiba VAGY Nem kérték a token keresést
-        if final_data.get('status') == 'failure' or not should_retry_for_token:
-             logging.info("Visszatérés (Nem kérték a token keresést, vagy technikai hiba).")
+        if final_data.get('status') == 'failure' and not final_data.get('tubi_token'):
+             # Ha technikai hiba volt és tokent sem kaptunk, visszatérés.
+             logging.info("Visszatérés (Playwright hiba és token hiánya).")
+             return jsonify(final_data)
+        
+        # Ha a belső API hívás engedélyezve volt, de az nem sikerült, még az is hiba (error-t beállítottuk fentebb)
+        if target_api_enabled and final_data.get('tubi_api_data') is None:
+             # Visszatérés a hibával, amit a make_internal_tubi_api_call állított be (500 Server Error)
+             logging.info("Visszatérés (Sikertelen belső API hívás, de a token megvan).")
              return jsonify(final_data)
 
-        # 2. Tubi Token Check (Csak akkor érünk ide, ha should_retry_for_token=True)
+        # 2. Tubi Token Check (Csak akkor érünk ide, ha sikeres volt a belső API hívás)
         if final_data.get('tubi_token'): 
             logging.info(f"Token sikeresen kinyerve a(z) {attempt}. kísérletben. Visszatérés.")
             return jsonify(final_data)
