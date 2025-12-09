@@ -9,7 +9,7 @@ from flask import Flask, request, jsonify
 from playwright.async_api import async_playwright, Route
 import requests
 import re      
-import urllib.parse # <--- FIX 1: Ezt az importot kell hozzáadni a NameError miatt
+import urllib.parse # <--- JAVÍTVA: Hozzáadva a NameError miatt
 from urllib.parse import urlparse, parse_qs, unquote
 from typing import Optional, Dict
 
@@ -58,8 +58,7 @@ def make_internal_tubi_api_call(search_term: str, token: str, device_id: str, us
         return None
 
     # Összeállítjuk a teljes Tubi API URL-t
-    # EZ A SOR JAVÍTÓDIK A FENTI URIB.PARSE IMPORTTAL
-    encoded_search_term = urllib.parse.quote(search_term) 
+    encoded_search_term = urllib.parse.quote(search_term) # JAVÍTVA: urllib.parse
     full_api_url = f"{TUBI_API_TEMPLATE}{encoded_search_term}"
 
     # Összeállítjuk a fejléceket
@@ -80,7 +79,7 @@ def make_internal_tubi_api_call(search_term: str, token: str, device_id: str, us
         return None
 
 # ----------------------------------------------------------------------
-# ASZINKRON PLAYWRIGHT SCRAPE FÜGGVÉNY (JAVÍTOTT: Visszaállítva a válasz testének ellenőrzése)
+# ASZINKRON PLAYWRIGHT SCRAPE FÜGGVÉNY 
 # ----------------------------------------------------------------------
 
 async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
@@ -103,7 +102,6 @@ async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
             # 1. User Agent kinyerése
             temp_context = await browser.new_context() 
             temp_page = await temp_context.new_page() 
-            # Ezt a részt módosítottam a korábbi logikámban, hogy ne az ideiglenes context-en futtassam, de most visszaállítom az eredeti (javított) logikát:
             user_agent = await temp_page.evaluate('navigator.userAgent')
             await temp_context.close()
             results['user_agent'] = user_agent
@@ -130,7 +128,7 @@ async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
 
                 await route.continue_() 
                 
-                # --- FIX 2: Ellenőrzés a VÁLASZ testében (token generáló végpont) ---
+                # --- 2. Ellenőrzés a VÁLASZ testében (token generáló végpont) ---
                 if not results['tubi_token'] and 'device/anonymous/token' in request.url:
                      response = await request.response() 
                      if response and response.ok:
@@ -210,7 +208,8 @@ def scrape_tubi_endpoint():
     if not url:
         return jsonify({'status': 'failure', 'error': 'Hiányzó "url" paraméter.'}), 400
     
-    target_api_enabled = request.args.get('target_api', '').lower() == 'true'
+    # A 'target_api' paraméter itt 'true' kell, hogy legyen!
+    target_api_enabled = request.args.get('target_api', '').lower() == 'true' 
     
     logging.info(f"API hívás indítása. Cél URL: {url}. Belső API hívás engedélyezve: {target_api_enabled}.")
 
