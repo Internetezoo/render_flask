@@ -5,7 +5,7 @@ import logging
 import base64
 import os
 import time
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response # <-- Response hozzáadva
 from playwright.async_api import async_playwright, Route
 import requests
 import re      
@@ -101,7 +101,7 @@ async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
         'tubi_device_id': None,
         'user_agent': None,
         'tubi_api_data': None,
-        'html_content': None # ÚJ: Ide mentjük a teljes HTML tartalmat
+        'html_content': None # Ide mentjük a teljes HTML tartalmat
     }
     
     async with async_playwright() as p:
@@ -267,7 +267,9 @@ def scrape_tubi_endpoint():
         # Ha a cél a HTML letöltése volt (target_api_enabled=False), akkor elég, ha a HTML megvan.
         if not target_api_enabled and final_data.get('html_content'):
              logging.info("Visszatérés (Sikeres HTML kinyerés).")
-             return jsonify(final_data)
+             # --- JAVÍTÁS: NYERS HTML-T KÜLDÜNK VISSZA JSON CSOMAGOLÁS NÉLKÜL ---
+             return Response(final_data['html_content'], mimetype='text/html')
+             # -------------------------------------------------------------------
 
         # 1. Sikeres Kimenet VAGY Technikai hiba VAGY Nem kérték a token keresést
         if final_data.get('status') == 'failure' and not final_data.get('tubi_token'):
