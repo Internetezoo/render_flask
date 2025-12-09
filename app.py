@@ -99,10 +99,10 @@ async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
         try:
             browser = await p.chromium.launch(headless=True)
             
-            # 1. User Agent kinyerése egy ideiglenes context-ből (JAVÍTVA)
+            # 1. User Agent kinyerése egy ideiglenes context-ből (A BrowserContext.evaluate hiba javítva!)
             temp_context = await browser.new_context() 
-            temp_page = await temp_context.new_page() # <-- ÚJ: Page létrehozása
-            user_agent = await temp_page.evaluate('navigator.userAgent') # <-- evaluate() a Page objektumon fut
+            temp_page = await temp_context.new_page() # <--- EZ A JAVÍTÁS: Page létrehozása!
+            user_agent = await temp_page.evaluate('navigator.userAgent') # evaluate() a Page objektumon fut
             await temp_context.close()
             results['user_agent'] = user_agent
             
@@ -152,7 +152,9 @@ async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
             logging.error(f"Playwright hiba: {e}")
             
         finally:
-            await browser.close()
+            # Csak akkor zárjuk a browsert ha megnyílt
+            if 'browser' in locals():
+                await browser.close()
             logging.info("✅ Playwright befejezve (élő elfogás).")
 
             # 3. Device ID kinyerése a tokenből, ha hiányzik a fejlécből
@@ -169,7 +171,6 @@ async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
                 query_params = parse_qs(url_parsed.query)
                 search_term_raw = query_params.get('search', [None])[0]
                 
-                # Ha a keresési szó hiányzik, de a hívás engedélyezve van, feltételezzük a Sanfort and Son-t.
                 search_term = unquote(search_term_raw) if search_term_raw else "Sanford and Son" 
 
                 if search_term:
