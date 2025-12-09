@@ -9,7 +9,7 @@ from flask import Flask, request, jsonify
 from playwright.async_api import async_playwright, Route
 import requests
 import re      
-import urllib.parse # FIX 1 (NameError javítása)
+import urllib.parse 
 from urllib.parse import urlparse, parse_qs, unquote
 from typing import Optional, Dict
 
@@ -18,14 +18,14 @@ nest_asyncio.apply()
 
 app = Flask(__name__)
 app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
-# JAVÍTÁS A: Átállítva DEBUG szintre a részletes hálózati logokhoz
+# Fontos: DEBUG szintre állítva a részletes hálózati logokhoz
 logging.basicConfig(level=logging.DEBUG)
 
 # --- KONFIGURÁCIÓS ÁLLANDÓK ---
 MAX_RETRIES = 3 # Maximum ennyi újrapróbálkozás a token megszerzésére
 DEVICE_ID_HEADER = "X-Tubi-Client-Device-ID"
 
-# Tubi API URL TEMPLATE
+# Tubi API URL TEMPLATE (MÓDOSÍTVA: search= paraméter előrébb hozva a sorrend miatt)
 TUBI_API_TEMPLATE = (
     "https://search.production-public.tubi.io/api/v2/search?"
     "images%5Bposterarts%5D=w408h583_poster&images%5Bhero_422%5D=w422h360_hero&"
@@ -33,7 +33,8 @@ TUBI_API_TEMPLATE = (
     "images%5Bhero_feature_small_mobile%5D=w540h450_hero&images%5Bhero_feature%5D=w375h355_hero&"
     "images%5Blandscape_images%5D=w978h549_landscape&images%5Blinear_larger_poster%5D=w978h549_landscape&"
     "images%5Bbackgrounds%5D=w1614h906_background&images%5Btitle_art%5D=w430h180_title&"
-    "include_channels=true&include_linear=true&is_kids_mode=false&search="
+    "search=" # A KÉRT HELYEN
+    "&include_channels=true&include_linear=true&is_kids_mode=false" # & hozzáadva és a többi paraméter
 )
 
 # ----------------------------------------------------------------------
@@ -50,7 +51,7 @@ def decode_jwt_payload(jwt_token: str) -> Optional[str]:
         payload_data = json.loads(payload_decoded)
         return payload_data.get('device_id')
     except Exception as e:
-        logging.debug(f"Hiba a JWT dekódolásánál: {e}")
+        logging.debug(f"DEBUG: [JWT HIBA] Hiba a JWT dekódolásánál: {e}")
         return None
 
 def make_internal_tubi_api_call(search_term: str, token: str, device_id: str, user_agent: str) -> Optional[Dict]:
@@ -61,6 +62,9 @@ def make_internal_tubi_api_call(search_term: str, token: str, device_id: str, us
 
     # Összeállítjuk a teljes Tubi API URL-t
     encoded_search_term = urllib.parse.quote(search_term) 
+    # A TUBI_API_TEMPLATE most már a "search=" -ben végződik, de ott is folytatódik a &include_channels-el.
+    # Azért, hogy a Python kódban a logikát ne kelljen szétszedni, a f-string-ben egyszerűen a végére illesztjük a keresést.
+    # Ezzel: ...images%5Btitle_art%5D=w430h180_title&search=Police%20Woman&include_channels=true...
     full_api_url = f"{TUBI_API_TEMPLATE}{encoded_search_term}"
 
     # Összeállítjuk a fejléceket
@@ -117,9 +121,9 @@ async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
             async def handle_request_for_token(route: Route):
                 request = route.request
                 
-                # JAVÍTÁS B: Hálózati forgalom logolása (DEBUG)
+                # DEBUG: Hálózati forgalom logolása
                 if 'tubi' in request.url.lower() or 'device' in request.url.lower():
-                     logging.debug(f"🔍 [HÁLÓZAT KÉRÉS] {request.method} - URL: {request.url}")
+                     logging.debug(f"DEBUG: [HÁLÓZAT KÉRÉS] {request.method} - URL: {request.url}")
                 
                 headers = request.headers
                 
@@ -127,6 +131,7 @@ async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
                 if not results['tubi_token'] and 'authorization' in headers and headers['authorization'].startswith('Bearer'):
                     token = headers['authorization'].split('Bearer ')[1].strip()
                     results['tubi_token'] = token
+                    # JELZI, HOGY MEGTALÁLTA
                     logging.info(f"🔑 Token rögzítve élő elfogással a KÉRÉS fejlécéből. ({token[:10]}...)")
                 
                 if not results['tubi_device_id'] and DEVICE_ID_HEADER.lower() in headers:
@@ -150,6 +155,7 @@ async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
                                  if device_id_from_token:
                                       results['tubi_device_id'] = device_id_from_token
                                  
+                                 # JELZI, HOGY MEGTALÁLTA
                                  logging.info(f"🔑 Token rögzítve élő elfogással a VÁLASZ testéből! ({token[:10]}...)")
                                  
                          except Exception as e:
@@ -163,15 +169,17 @@ async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
             await page.route(lambda url: url.lower().endswith(('.png', '.jpg', '.gif', '.css', '.woff2')), lambda route: route.abort())
 
             # Betöltjük az oldalt
+            logging.info("🌐 Oldal betöltése (wait_until='networkidle')...")
             await page.goto(url, wait_until="networkidle", timeout=30000) 
             
-            # Rövid várakozás
-            await page.wait_for_timeout(5000)
+            # NÖVELT VÁRAKOZÁS: Több időt adunk a késleltetett token generáló kérésnek (2000 -> 5000ms)
+            logging.info("⏳ Kényszerített várakozás 5 másodperc a token rögzítésére.")
+            await page.wait_for_timeout(5000) 
 
         except Exception as e:
             results['status'] = 'failure'
             results['error'] = f"Playwright hiba: {str(e)}"
-            logging.error(f"Playwright hiba: {e}")
+            logging.error(f"❌ Playwright hiba: {e}")
             
         finally:
             if browser:
@@ -190,8 +198,17 @@ async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
                 # search_term kinyerése az URL-ből
                 url_parsed = urlparse(url)
                 query_params = parse_qs(url_parsed.query)
-                search_term_raw = query_params.get('search', [None])[0]
+                # Ellenőrzi a ?q= vagy a ?search= paramétereket.
+                search_term_raw = query_params.get('search', query_params.get('q', [None]))[0]
                 
+                # Ha nem talál query paramétert, próbálja meg az URL path-jából kinyerni (pl. /search/Ace%20Crawford)
+                if not search_term_raw and 'search/' in url_parsed.path:
+                     # Kinyeri a path utolsó elemét a search után
+                     path_segments = url_parsed.path.rstrip('/').split('/')
+                     if path_segments[-2] == 'search':
+                         search_term_raw = path_segments[-1]
+
+                # Ha még mindig nincs találat, használja a 'Sanford and Son' alapértelmezett értéket 
                 search_term = unquote(search_term_raw) if search_term_raw else "Sanford and Son" 
 
                 if search_term:
@@ -215,6 +232,7 @@ def scrape_tubi_endpoint():
     if not url:
         return jsonify({'status': 'failure', 'error': 'Hiányzó "url" paraméter.'}), 400
     
+    # target_api paraméterrel engedélyezzük a belső Tubi API hívást
     target_api_enabled = request.args.get('target_api', '').lower() == 'true'
     
     logging.info(f"API hívás indítása. Cél URL: {url}. Belső API hívás engedélyezve: {target_api_enabled}.")
