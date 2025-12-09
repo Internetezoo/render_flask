@@ -18,7 +18,7 @@ nest_asyncio.apply()
 
 app = Flask(__name__)
 app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 
 # --- KONFIGURÁCIÓS ÁLLANDÓK ---
 MAX_RETRIES = 3 # Maximum ennyi újrapróbálkozás a token megszerzésére
