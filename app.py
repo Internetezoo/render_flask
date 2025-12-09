@@ -166,7 +166,7 @@ async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
             await page.goto(url, wait_until="networkidle", timeout=30000) 
             
             # Rövid várakozás
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(5000)
 
         except Exception as e:
             results['status'] = 'failure'
