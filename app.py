@@ -159,9 +159,11 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, html_enabled: bool, 
             # Hálózati forgalom blokkolása (minden esetben a gyorsabb betöltésért)
             await page.route("**/google-analytics**", abort_requests)
             
-            # Regex a kép/font/CSS fájlok blokkolásához. (A lambda eltávolítása a 'str' object is not callable hiba javítására)
-            IMAGE_BLOCK_REGEX = r'.*\.(png|jpg|gif|css|woff2|ico|svg|webp|jpeg)(\?.*)?$'
-            await page.route(re.compile(IMAGE_BLOCK_REGEX), abort_requests)
+            # --- JAVÍTÁS ---
+            # Glob mintával a Python regex/lambda callable hiba elkerülésére.
+            # Blokkolja a leggyakoribb statikus fájlokat.
+            await page.route("**/*.{png,jpg,gif,css,woff2,ico,svg,webp,jpeg}", abort_requests)
+            # --- END JAVÍTÁS ---
             
             # --- MÓDOSÍTOTT LOGIKA: CSAK AKKOR KELL AZ ÉLŐFOGÁS, HA 'target_api' IS FUT ---
             if target_api_enabled:
