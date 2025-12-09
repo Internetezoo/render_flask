@@ -84,7 +84,6 @@ def make_internal_tubi_api_call(search_term: str, token: str, device_id: str, us
         response.raise_for_status() 
         return response.json()
     except requests.exceptions.RequestException as e:
-        # Itt van a hiba, ami miatt a PROXY a konzolon hibát írt ki (500)
         logging.error(f"Belső API hívási hiba: {e}")
         return None
 
@@ -101,7 +100,8 @@ async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
         'tubi_token': None,
         'tubi_device_id': None,
         'user_agent': None,
-        'tubi_api_data': None 
+        'tubi_api_data': None,
+        'html_content': None # ÚJ: Ide mentjük a teljes HTML tartalmat
     }
     
     async with async_playwright() as p:
@@ -180,6 +180,16 @@ async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
             logging.info("⏳ Kényszerített várakozás 5 másodperc a token rögzítésére.")
             await page.wait_for_timeout(5000) 
 
+            # --- ÚJ LÉPÉS: A NYERS HTML TARTALOM KIMENTÉSE ---
+            try:
+                html_content = await page.content()
+                results['html_content'] = html_content # Ide mentjük a teljes renderelt HTML-t
+                logging.info("📝 A lap tartalmát (HTML) sikeresen kimentette.")
+            except Exception as e_content:
+                logging.error(f"❌ Hiba a lap tartalmának (HTML) kimentésekor: {e_content}")
+                results['html_content'] = "ERROR: Failed to retrieve HTML content."
+            # --- ÚJ LÉPÉS VÉGE ---
+
         except Exception as e:
             results['status'] = 'failure'
             results['error'] = f"Playwright hiba: {str(e)}"
@@ -243,6 +253,7 @@ def scrape_tubi_endpoint():
     
     logging.info(f"API hívás indítása. Cél URL: {url}. Belső API hívás engedélyezve: {target_api_enabled}.")
 
+    # Ha engedélyezve van a token keresés, többször is próbálkozunk
     should_retry_for_token = target_api_enabled
 
     retry_count = MAX_RETRIES if should_retry_for_token else 1 
@@ -253,15 +264,20 @@ def scrape_tubi_endpoint():
         loop = asyncio.get_event_loop()
         final_data = loop.run_until_complete(scrape_tubitv(url, target_api_enabled))
         
+        # Ha a cél a HTML letöltése volt (target_api_enabled=False), akkor elég, ha a HTML megvan.
+        if not target_api_enabled and final_data.get('html_content'):
+             logging.info("Visszatérés (Sikeres HTML kinyerés).")
+             return jsonify(final_data)
+
         # 1. Sikeres Kimenet VAGY Technikai hiba VAGY Nem kérték a token keresést
         if final_data.get('status') == 'failure' and not final_data.get('tubi_token'):
              # Ha technikai hiba volt és tokent sem kaptunk, visszatérés.
              logging.info("Visszatérés (Playwright hiba és token hiánya).")
              return jsonify(final_data)
         
-        # Ha a belső API hívás engedélyezve volt, de az nem sikerült, még az is hiba (error-t beállítottuk fentebb)
+        # Ha a belső API hívás engedélyezve volt, de az nem sikerült
         if target_api_enabled and final_data.get('tubi_api_data') is None:
-             # Visszatérés a hibával, amit a make_internal_tubi_api_call állított be (500 Server Error)
+             # Visszatérés a hibával, amit a make_internal_tubi_api_call állított be
              logging.info("Visszatérés (Sikertelen belső API hívás, de a token megvan).")
              return jsonify(final_data)
 
