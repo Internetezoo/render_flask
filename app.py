@@ -80,7 +80,7 @@ def make_internal_tubi_api_call(search_term: str, token: str, device_id: str, us
         return None
 
 # ----------------------------------------------------------------------
-# ASZINKRON PLAYWRIGHT SCRAPE FÜGGVÉNY (JAVÍTOTT: ÉLŐ ELFOGÁS)
+# ASZINKRON PLAYWRIGHT SCRAPE FÜGGVÉNY (JAVÍTOTT: evaluate hiba)
 # ----------------------------------------------------------------------
 
 async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
@@ -99,9 +99,10 @@ async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
         try:
             browser = await p.chromium.launch(headless=True)
             
-            # 1. User Agent kinyerése egy ideiglenes context-ből (AWAIT HIBA JAVÍTVA)
+            # 1. User Agent kinyerése egy ideiglenes context-ből (JAVÍTVA)
             temp_context = await browser.new_context() 
-            user_agent = await temp_context.evaluate('navigator.userAgent')
+            temp_page = await temp_context.new_page() # <-- ÚJ: Page létrehozása
+            user_agent = await temp_page.evaluate('navigator.userAgent') # <-- evaluate() a Page objektumon fut
             await temp_context.close()
             results['user_agent'] = user_agent
             
@@ -168,6 +169,7 @@ async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
                 query_params = parse_qs(url_parsed.query)
                 search_term_raw = query_params.get('search', [None])[0]
                 
+                # Ha a keresési szó hiányzik, de a hívás engedélyezve van, feltételezzük a Sanfort and Son-t.
                 search_term = unquote(search_term_raw) if search_term_raw else "Sanford and Son" 
 
                 if search_term:
@@ -201,7 +203,6 @@ def scrape_tubi_endpoint():
     retry_count = MAX_RETRIES if should_retry_for_token else 1 
 
     for attempt in range(1, retry_count + 1):
-        # A log üzenet frissítve lett target_api-ra
         logging.info(f"Kísérlet {attempt}/{retry_count} a scrape futtatására. URL: {url} (Belső API engedélyezve: {target_api_enabled})")
         
         loop = asyncio.get_event_loop()
