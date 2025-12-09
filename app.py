@@ -41,9 +41,7 @@ TUBI_API_TEMPLATE = (
 def decode_jwt_payload(jwt_token: str) -> Optional[str]:
     """Dekódolja a JWT payload részét és kinyeri a device_id-t."""
     try:
-        # A JWT token második része a payload
         payload_base64 = jwt_token.split('.')[1]
-        # Padding kiegészítése base64 dekódoláshoz
         padding = '=' * (4 - len(payload_base64) % 4)
         payload_decoded = base64.b64decode(payload_base64 + padding).decode('utf-8')
         
@@ -80,7 +78,7 @@ def make_internal_tubi_api_call(search_term: str, token: str, device_id: str, us
         return None
 
 # ----------------------------------------------------------------------
-# ASZINKRON PLAYWRIGHT SCRAPE FÜGGVÉNY (JAVÍTOTT: evaluate hiba)
+# ASZINKRON PLAYWRIGHT SCRAPE FÜGGVÉNY (JAVÍTOTT: evaluate és válasz test)
 # ----------------------------------------------------------------------
 
 async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
@@ -99,40 +97,59 @@ async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
         try:
             browser = await p.chromium.launch(headless=True)
             
-            # 1. User Agent kinyerése egy ideiglenes context-ből (A BrowserContext.evaluate hiba javítva!)
+            # 1. User Agent kinyerése
             temp_context = await browser.new_context() 
-            temp_page = await temp_context.new_page() # <--- EZ A JAVÍTÁS: Page létrehozása!
-            user_agent = await temp_page.evaluate('navigator.userAgent') # evaluate() a Page objektumon fut
+            temp_page = await temp_context.new_page() # Létrehozunk egy ideiglenes oldalt a User Agent kinyeréséhez
+            user_agent = await temp_page.evaluate('navigator.userAgent')
             await temp_context.close()
             results['user_agent'] = user_agent
             
             # 2. A tényleges context létrehozása
-            if not target_api_enabled:
-                context = await browser.new_context()
-            else:
-                # Geo-blocking elkerülése
-                context = await browser.new_context(locale='en-US', timezone_id='America/New_York')
-
+            # Ha engedélyezve van a belső API hívás, beállítjuk a helyi beállításokat
+            context = await browser.new_context(locale='en-US', timezone_id='America/New_York') if target_api_enabled else await browser.new_context()
             page = await context.new_page()
             page.set_default_timeout(30000)
 
-            # Eseménykezelő a token és Device ID élő rögzítéséhez a fejlécekből
+            # Eseménykezelő a token és Device ID élő rögzítéséhez
             async def handle_request_for_token(route: Route):
                 request = route.request
                 headers = request.headers
                 
-                # 1. Token rögzítése az Authorization fejlécből
+                # --- 1. Ellenőrzés a KÉRÉS fejlécében (ha már korábban kinyerték és küldik) ---
                 if not results['tubi_token'] and 'authorization' in headers and headers['authorization'].startswith('Bearer'):
                     token = headers['authorization'].split('Bearer ')[1].strip()
                     results['tubi_token'] = token
-                    logging.info(f"🔑 Token rögzítve élő elfogással. ({token[:10]}...)")
+                    logging.info(f"🔑 Token rögzítve élő elfogással a KÉRÉS fejlécéből. ({token[:10]}...)")
                 
-                # 2. Device ID rögzítése
                 if not results['tubi_device_id'] and DEVICE_ID_HEADER.lower() in headers:
                     results['tubi_device_id'] = headers[DEVICE_ID_HEADER.lower()]
-                    logging.info(f"📱 Device ID rögzítve élő elfogással. ({results['tubi_device_id']})")
+                    logging.info(f"📱 Device ID rögzítve élő elfogással a KÉRÉS fejlécéből. ({results['tubi_device_id']})")
 
+                # Fontos: A kérés továbbítása (engedélyezni kell a válasz letöltését)
                 await route.continue_() 
+                
+                # --- 2. Ellenőrzés a VÁLASZ testében (token generáló végpont) ---
+                # Ha a token generáló API-ra érkezik a kérés és még nincs tokenünk
+                if not results['tubi_token'] and 'device/anonymous/token' in request.url:
+                     response = await request.response() 
+                     if response and response.ok:
+                         try:
+                             # Kinyerjük a válasz tartalmát
+                             response_json = await response.json()
+                             token = response_json.get('access_token')
+                             
+                             if token:
+                                 results['tubi_token'] = token
+                                 # Kinyerjük az ID-t a token payloadból (ez a biztonságos módszer)
+                                 device_id_from_token = decode_jwt_payload(token)
+                                 if device_id_from_token:
+                                      results['tubi_device_id'] = device_id_from_token
+                                 
+                                 logging.info(f"🔑 Token rögzítve élő elfogással a VÁLASZ testéből! ({token[:10]}...)")
+                                 
+                         except Exception as e:
+                             logging.warning(f"Figyelem: Token válasz JSON dekódolási hiba: {e}")
+                             pass
 
             await page.route("**/*", handle_request_for_token)
             
@@ -140,7 +157,7 @@ async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
             await page.route("**/google-analytics**", lambda route: route.abort())
             await page.route(lambda url: url.lower().endswith(('.png', '.jpg', '.gif', '.css', '.woff2')), lambda route: route.abort())
 
-            # Betöltjük az oldalt
+            # Betöltjük az oldalt (ez generálja a tokent a háttérben)
             await page.goto(url, wait_until="networkidle", timeout=30000) 
             
             # Rövid várakozás a token kérések befejezéséhez
@@ -157,20 +174,21 @@ async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
                 await browser.close()
             logging.info("✅ Playwright befejezve (élő elfogás).")
 
-            # 3. Device ID kinyerése a tokenből, ha hiányzik a fejlécből
+            # 3. Kiegészítés: Device ID kinyerése a tokenből, ha hiányzik
             if results['tubi_token'] and not results['tubi_device_id']:
                 device_id_from_token = decode_jwt_payload(results['tubi_token'])
                 if device_id_from_token:
                     results['tubi_device_id'] = device_id_from_token
-                    logging.info("📱 Device ID kinyerve a token payloadból.")
+                    logging.info("📱 Device ID kinyerve a token payloadból (Fallback).")
 
-            # 4. Belső API hívás
+            # 4. Belső API hívás, ha a token és az ID is megvan, és a kliens kérte
             if target_api_enabled and results['tubi_token'] and results['tubi_device_id']:
                 # search_term kinyerése az URL-ből
                 url_parsed = urlparse(url)
                 query_params = parse_qs(url_parsed.query)
                 search_term_raw = query_params.get('search', [None])[0]
                 
+                # Alapértelmezett keresési szó, ha hiányzik a paraméterből
                 search_term = unquote(search_term_raw) if search_term_raw else "Sanford and Son" 
 
                 if search_term:
