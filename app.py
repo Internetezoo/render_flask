@@ -152,14 +152,16 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, html_enabled: bool, 
                 page.on('console', lambda msg: results['console_logs'].append({'type': msg.type, 'text': msg.text}))
                 page.on('pageerror', lambda error: results['console_logs'].append({'type': 'error', 'text': str(error)}))
             
-            # --- Javítás: Áttérés standard aszinkron függvényre a lambda helyett ---
+            # Handler függvény a blokkoláshoz
             async def abort_requests(route):
                 await route.abort()
-                
+
             # Hálózati forgalom blokkolása (minden esetben a gyorsabb betöltésért)
             await page.route("**/google-analytics**", abort_requests)
-            await page.route(lambda url: url.lower().endswith(('.png', '.jpg', '.gif', '.css', '.woff2')), abort_requests)
-            # ---------------------------------------------------------------------
+            
+            # Regex a kép/font/CSS fájlok blokkolásához. (A lambda eltávolítása a 'str' object is not callable hiba javítására)
+            IMAGE_BLOCK_REGEX = r'.*\.(png|jpg|gif|css|woff2|ico|svg|webp|jpeg)(\?.*)?$'
+            await page.route(re.compile(IMAGE_BLOCK_REGEX), abort_requests)
             
             # --- MÓDOSÍTOTT LOGIKA: CSAK AKKOR KELL AZ ÉLŐFOGÁS, HA 'target_api' IS FUT ---
             if target_api_enabled:
