@@ -23,7 +23,7 @@ logging.basicConfig(level=logging.INFO)
 MAX_RETRIES = 3 # Maximum ennyi újrapróbálkozás a token megszerzésére
 DEVICE_ID_HEADER = "X-Tubi-Client-Device-ID"
 
-# Tubi API URL TEMPLATE (VÁLTOZATLAN)
+# Tubi API URL TEMPLATE
 TUBI_API_TEMPLATE = (
     "https://search.production-public.tubi.io/api/v2/search?"
     "images%5Bposterarts%5D=w408h583_poster&images%5Bhero_422%5D=w422h360_hero&"
@@ -35,15 +35,18 @@ TUBI_API_TEMPLATE = (
 )
 
 # ----------------------------------------------------------------------
-# SEGÉDFÜGGVÉNYEK (Dekódolás, API hívás)
+# SEGÉDFÜGGVÉNYEK
 # ----------------------------------------------------------------------
 
 def decode_jwt_payload(jwt_token: str) -> Optional[str]:
     """Dekódolja a JWT payload részét és kinyeri a device_id-t."""
     try:
+        # A JWT token második része a payload
         payload_base64 = jwt_token.split('.')[1]
+        # Padding kiegészítése base64 dekódoláshoz
         padding = '=' * (4 - len(payload_base64) % 4)
         payload_decoded = base64.b64decode(payload_base64 + padding).decode('utf-8')
+        
         payload_data = json.loads(payload_decoded)
         return payload_data.get('device_id')
     except Exception:
@@ -77,13 +80,12 @@ def make_internal_tubi_api_call(search_term: str, token: str, device_id: str, us
         return None
 
 # ----------------------------------------------------------------------
-# ASZINKRON PLAYWRIGHT SCRAPE FÜGGVÉNY (JELENTŐSEN JAVÍTVA)
+# ASZINKRON PLAYWRIGHT SCRAPE FÜGGVÉNY (JAVÍTOTT: ÉLŐ ELFOGÁS)
 # ----------------------------------------------------------------------
 
 async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
     """Betölti a Tubi oldalt és élő hálózati forgalom elfogással kinyeri a tokent."""
     
-    # Két változót használunk a token és ID tárolására, amit az eseménykezelő frissít
     results = {
         'status': 'success',
         'url': url,
@@ -93,18 +95,21 @@ async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
         'tubi_api_data': None 
     }
     
-    # Playwright aszinkron blokk indítása
     async with async_playwright() as p:
         try:
             browser = await p.chromium.launch(headless=True)
-            user_agent = await browser.new_context().evaluate('navigator.userAgent')
+            
+            # 1. User Agent kinyerése egy ideiglenes context-ből (AWAIT HIBA JAVÍTVA)
+            temp_context = await browser.new_context() 
+            user_agent = await temp_context.evaluate('navigator.userAgent')
+            await temp_context.close()
             results['user_agent'] = user_agent
             
-            # Fontos: Ha a target_api nincs engedélyezve, csak a token kinyeréséért fut a Playwright.
+            # 2. A tényleges context létrehozása
             if not target_api_enabled:
                 context = await browser.new_context()
             else:
-                # Geo-blocking elkerülése a böngésző nyelv beállításával (példa: US)
+                # Geo-blocking elkerülése
                 context = await browser.new_context(locale='en-US', timezone_id='America/New_York')
 
             page = await context.new_page()
@@ -130,14 +135,14 @@ async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
 
             await page.route("**/*", handle_request_for_token)
             
-            # Blokkoljuk a felesleges erőforrásokat, mint korábban
+            # Blokkoljuk a felesleges erőforrásokat
             await page.route("**/google-analytics**", lambda route: route.abort())
             await page.route(lambda url: url.lower().endswith(('.png', '.jpg', '.gif', '.css', '.woff2')), lambda route: route.abort())
 
-            # Betöltjük az oldalt (ez generálja a tokent a háttérben)
+            # Betöltjük az oldalt
             await page.goto(url, wait_until="networkidle", timeout=30000) 
             
-            # Várjunk egy kicsit, hogy az utolsó token kérés is megtörténjen (biztonsági okból)
+            # Rövid várakozás a token kérések befejezéséhez
             await page.wait_for_timeout(2000)
 
         except Exception as e:
@@ -149,16 +154,22 @@ async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
             await browser.close()
             logging.info("✅ Playwright befejezve (élő elfogás).")
 
-            # 3. Kiegészítés: Device ID kinyerése a tokenből, ha csak a token van meg
+            # 3. Device ID kinyerése a tokenből, ha hiányzik a fejlécből
             if results['tubi_token'] and not results['tubi_device_id']:
                 device_id_from_token = decode_jwt_payload(results['tubi_token'])
                 if device_id_from_token:
                     results['tubi_device_id'] = device_id_from_token
                     logging.info("📱 Device ID kinyerve a token payloadból.")
 
-            # 4. Belső API hívás, ha a token és az ID is megvan, és a kliens kérte
+            # 4. Belső API hívás
             if target_api_enabled and results['tubi_token'] and results['tubi_device_id']:
-                search_term = parse_qs(urlparse(url).query).get('search', [None])[0]
+                # search_term kinyerése az URL-ből
+                url_parsed = urlparse(url)
+                query_params = parse_qs(url_parsed.query)
+                search_term_raw = query_params.get('search', [None])[0]
+                
+                search_term = unquote(search_term_raw) if search_term_raw else "Sanford and Son" 
+
                 if search_term:
                     tubi_api_data = make_internal_tubi_api_call(search_term, results['tubi_token'], results['tubi_device_id'], results['user_agent'])
                     results['tubi_api_data'] = tubi_api_data
@@ -171,29 +182,26 @@ async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
         return results
 
 # ----------------------------------------------------------------------
-# FLASK ÚTVONAL KEZELÉS (VÁLTOZATLAN)
+# FLASK ÚTVONAL KEZELÉS
 # ----------------------------------------------------------------------
 
 @app.route('/scrape', methods=['GET'])
 def scrape_tubi_endpoint():
-    # ... (tartalom változatlan) ...
     url = request.args.get('url')
     if not url:
         return jsonify({'status': 'failure', 'error': 'Hiányzó "url" paraméter.'}), 400
     
-    # Logikát váltunk a request.args.get('target_api') paraméterrel. 
-    # Ha ez True, akkor token kinyerés és belső API hívás történik.
     target_api_enabled = request.args.get('target_api', '').lower() == 'true'
     
     logging.info(f"API hívás indítása. Cél URL: {url}. Belső API hívás engedélyezve: {target_api_enabled}.")
 
-    # Annak biztosítása, hogy a Playwright futásához szükséges paraméterek engedélyezettek legyenek
     should_retry_for_token = target_api_enabled
 
     # Megpróbáljuk futtatni a scrape-et, maximum 3-szor.
     retry_count = MAX_RETRIES if should_retry_for_token else 1 
 
     for attempt in range(1, retry_count + 1):
+        # A log üzenet frissítve lett target_api-ra
         logging.info(f"Kísérlet {attempt}/{retry_count} a scrape futtatására. URL: {url} (Belső API engedélyezve: {target_api_enabled})")
         
         loop = asyncio.get_event_loop()
@@ -201,7 +209,6 @@ def scrape_tubi_endpoint():
         
         # 1. Sikeres Kimenet VAGY Technikai hiba VAGY Nem kérték a token keresést
         if final_data.get('status') == 'failure' or not should_retry_for_token:
-             # Ha technikai hiba van, vagy a tokent nem is kerestük, azonnal visszatérünk.
              logging.info("Visszatérés (Nem kérték a token keresést, vagy technikai hiba).")
              return jsonify(final_data)
 
@@ -210,10 +217,10 @@ def scrape_tubi_endpoint():
             logging.info(f"Token sikeresen kinyerve a(z) {attempt}. kísérletben. Visszatérés.")
             return jsonify(final_data)
 
-        # 3. Újrapróbálkozás (Csak akkor fut, ha should_retry_for_token=True és nincs token)
+        # 3. Újrapróbálkozás
         if attempt < retry_count:
             logging.warning(f"Token nem található. Újrapróbálkozás {attempt + 1}. kísérlet...")
-            time.sleep(2) # Rövid várakozás a következő kísérlet előtt
+            time.sleep(2) # Rövid várakozás
     
     logging.error("A token nem volt kinyerhető az összes kísérlet után sem.")
     return jsonify(final_data)
