@@ -21,7 +21,7 @@ app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
 # Fontos: DEBUG szintre állítva a részletes hálózati logokhoz
 logging.basicConfig(level=logging.DEBUG)
 
-# --- ÚJ: LISTHANDLER OSZTÁLY a logok gyűjtésére (5. opcióhoz) ---
+# --- LISTHANDLER OSZTÁLY a logok gyűjtésére ---
 class ListHandler(logging.Handler):
     """Egyéni logger kezelő, amely a logüzeneteket egy listába gyűjti."""
     def __init__(self, log_list):
@@ -31,7 +31,9 @@ class ListHandler(logging.Handler):
         self.log_list = log_list
 
     def emit(self, record):
-        self.log_list.append(self.format(record))
+        # Csak a simple_log_enabled esetén gyűjt
+        if record.levelno >= logging.DEBUG: # DEBUG szinttől kezdve gyűjtjük
+             self.log_list.append(self.format(record))
 # ------------------------------------------------------------------
 
 # --- KONFIGURÁCIÓS ÁLLANDÓK ---
@@ -110,6 +112,19 @@ def make_internal_tubi_api_call(search_term: str, token: str, device_id: str, us
         logging.error(f"Belső API hívási hiba: {e}")
         return None
 
+# --- ÚJ ASZINKRON FÜGGVÉNY a Pollinghoz ---
+async def wait_for_token(results: Dict, timeout: int = 15, interval: float = 0.5) -> bool:
+    """Várakozik a 'tubi_token' megjelenésére a 'results' szótárban, polling módszerrel."""
+    start_time = time.time()
+    
+    while time.time() - start_time < timeout:
+        if results.get('tubi_token'):
+            return True
+        await asyncio.sleep(interval)
+        
+    return False
+# -----------------------------------------
+
 # ----------------------------------------------------------------------
 # ASZINKRON PLAYWRIGHT SCRAPE FÜGGVÉNY 
 # ----------------------------------------------------------------------
@@ -129,7 +144,7 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
         'har_content': None 
     }
     
-    # Szerver DEBUG Log Fogás Beállítása (5. opcióhoz)
+    # Szerver DEBUG Log Fogás Beállítása 
     root_logger = logging.getLogger()
     list_handler = None
     
@@ -177,7 +192,7 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
                 async def handle_request_token_and_log(route: Route):
                     request = route.request
                     
-                    # 1. Hálózati logolás (MINDIG fut, ha az 5-ös opció engedélyezve van)
+                    # 1. Hálózati logolás
                     if simple_log_enabled:
                         logging.debug(f"DEBUG: [HÁLÓZAT KÉRÉS] {request.method} - URL: {request.url}")
                     
@@ -186,7 +201,7 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
                         headers = request.headers
                         
                         # --- 1. Token rögzítése a KÉRÉS fejlécéből ---
-                        # Ez a legmegbízhatóbb módszer, mivel minden belső API hívásban szerepel.
+                        # Ez a legmegbízhatóbb módszer.
                         if not results['tubi_token'] and 'authorization' in headers and headers['authorization'].startswith('Bearer'):
                             token = headers['authorization'].split('Bearer ')[1].strip()
                             results['tubi_token'] = token
@@ -197,15 +212,13 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
                             results['tubi_device_id'] = headers[DEVICE_ID_HEADER.lower()]
                             logging.info(f"📱 Device ID rögzítve élő elfogással a KÉRÉS fejlécéből. ({results['tubi_device_id']})")
 
-                        # --- 3. JAVÍTÁS: Device ID rögzítése az URL query paraméterből (Fallback) ---
+                        # --- 3. Device ID rögzítése az URL query paraméterből (Fallback) ---
                         if not results['tubi_device_id'] and ('tubi.io' in request.url or 'tubitv.com' in request.url):
                              query_params = parse_qs(urlparse(request.url).query)
                              device_id_from_url = query_params.get('device_id', [None])[0]
                              if device_id_from_url:
                                  results['tubi_device_id'] = device_id_from_url
-                                 logging.info(f"📱 Device ID rögzítve az URL query paraméterből (Fallback). ({results['tubi_device_id']})")
-                        
-                        # --- A VÁLASZ BODY elemzés (amit a TargetClosedError miatt kivettünk) ide nem jön ---
+                                 logging.info(f"📱 Device ID rögzítve az URL query paraméterből (Fallback 1). ({results['tubi_device_id']})")
                         
                     await route.continue_() 
 
@@ -218,28 +231,19 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
             await page.goto(url, wait_until="networkidle", timeout=60000) 
             
             if target_api_enabled:
-                # --- JAVÍTÁS: Robusztus várakozás a token-tartalmú kérésre ---
-                logging.info("⏳ Várakozás egy belső API hívásra, amely tartalmazza az 'Authorization' tokent...")
-                try:
-                    # Keressük az első olyan request-et, aminek van Authorization fejléce
-                    await page.wait_for_request(
-                        lambda req: 'authorization' in req.headers, 
-                        timeout=15000 # 15 másodpercet várunk
-                    )
-                    logging.info("🔑 Token-tartalmú kérés elfogva. Az útvonal-kezelő rögzítette a tokent.")
-                except Exception as e:
-                    # Ha a várakozás időtúllépés miatt bukik, de a token már rögzítve van, az OK.
-                    if not results['tubi_token']:
-                        logging.warning(f"❌ Token-tartalmú kérés nem jött meg a 15 másodperces időtúllépés alatt. Lehet, hogy a token nem került rögzítésre. Hiba: {e}")
-                    else:
-                        logging.info("✅ A token már rögzítve volt a várakozás előtt.")
+                # --- JAVÍTÁS: Robusztus várakozás a tokenre (Polling) ---
+                logging.info("⏳ Várakozás a token rögzítésére (Polling módszer, max. 15 másodperc)...")
+                token_found = await wait_for_token(results, timeout=15)
+                
+                if token_found:
+                    logging.info("🔑 Token sikeresen rögzítve a várakozási ciklusban.")
+                elif not results.get('tubi_token'):
+                    logging.warning("❌ A token nem került rögzítésre a 15 másodperces várakozási időn belül.")
                 # -------------------------------------------------------------
 
-            # --- JAVÍTÁS: Unroute a TargetClosedError elkerülésére ---
+            # --- Unroute a TargetClosedError elkerülésére ---
             logging.info("🧹 Playwright útvonal-kezelők leállítása.")
-            # Unroute a route() leállítása után kell futnia
             if simple_log_enabled or target_api_enabled:
-                 # Ha a route() regisztrálva volt, unroute_all-t hívunk
                 await page.unroute_all(behavior='ignoreErrors') 
             # ----------------------------------------------------
 
@@ -263,7 +267,6 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
                 root_logger.removeHandler(list_handler)
             
             if browser:
-                 # A context.close() automatikusan zárja a böngészőt, ha nincs más context
                  await browser.close()
             logging.info("✅ Playwright befejezve.")
 
@@ -279,9 +282,8 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
                     results['har_content'] = "ERROR: Failed to retrieve HAR content."
             # ----------------------------------------------------
 
-            # 3. Kiegészítés: Device ID kinyerése a tokenből, ha hiányzik (csak ha target_api_enabled)
+            # 3. Kiegészítés: Device ID kinyerése a tokenből, ha hiányzik (Fallback 2)
             if target_api_enabled:
-                # Ezt a lépést csak akkor futtatjuk, ha a fenti két módszer nem járt sikerrel
                 if results['tubi_token'] and not results['tubi_device_id']:
                     device_id_from_token = decode_jwt_payload(results['tubi_token'])
                     if device_id_from_token:
@@ -291,6 +293,7 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
             # 4. Belső API hívás (csak ha target_api_enabled)
             if target_api_enabled and results['tubi_token'] and results['tubi_device_id']:
                 url_parsed = urlparse(url)
+                # ... (A search_term kinyerési logika változatlan) ...
                 query_params = parse_qs(url_parsed.query)
                 search_term_raw = query_params.get('search', query_params.get('q', [None]))[0]
                 
@@ -326,6 +329,7 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
 
 @app.route('/scrape', methods=['GET'])
 def scrape_tubi_endpoint():
+    # ... (a Flask endpoint kódja változatlan, az újrapróbálkozási logika továbbra is a helyén van) ...
     url = request.args.get('url')
     if not url:
         return jsonify({'status': 'failure', 'error': 'Hiányzó "url" paraméter.'}), 400
