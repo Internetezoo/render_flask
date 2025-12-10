@@ -8,8 +8,8 @@ import time
 from flask import Flask, request, jsonify, Response
 from playwright.async_api import async_playwright, Route
 import requests
-import re      
-import urllib.parse 
+import re
+import urllib.parse
 from urllib.parse import urlparse, parse_qs, unquote
 from typing import Optional, Dict
 
@@ -35,7 +35,7 @@ class ListHandler(logging.Handler):
 # ------------------------------------------------------------------
 
 # --- KONFIGURÁCIÓS ÁLLANDÓK ---
-MAX_RETRIES = 3 
+MAX_RETRIES = 3
 DEVICE_ID_HEADER = "X-Tubi-Client-Device-ID"
 
 # 1. Tubi API URL TEMPLATE ELŐTAGJA
@@ -46,7 +46,7 @@ TUBI_API_TEMPLATE_PREFIX = (
     "images%5Bhero_feature_small_mobile%5D=w540h450_hero&images%5Bhero_feature%5D=w375h355_hero&"
     "images%5Blandscape_images%5D=w978h549_landscape&images%5Blinear_larger_poster%5D=w978h549_landscape&"
     "images%5Bbackgrounds%5D=w1614h906_background&images%5Btitle_art%5D=w430h180_title&"
-    "search=" 
+    "search="
 )
 
 # 2. Tubi API URL TEMPLATE UTÓTAGJA
@@ -199,23 +199,31 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
 
                         # --- 2. Ellenőrzés a VÁLASZ testében (token generáló végpont) ---
                         if not results['tubi_token'] and 'device/anonymous/token' in request.url:
-                             response = await request.response() 
-                             if response and response.ok:
-                                 try:
-                                     response_json = await response.json()
-                                     token = response_json.get('access_token')
-                                     
-                                     if token:
-                                         results['tubi_token'] = token
-                                         device_id_from_token = decode_jwt_payload(token)
-                                         if device_id_from_token:
-                                              results['tubi_device_id'] = device_id_from_token
-                                         
-                                         logging.info(f"🔑 Token rögzítve élő elfogással a VÁLASZ testéből! ({token[:10]}...)")
-                                         
-                                 except Exception:
-                                     pass 
-                    
+                            # Ezt a részt érintette a TargetClosedError hiba
+                            try:
+                                response = await request.response() 
+                                if response and response.ok:
+                                    try:
+                                        response_json = await response.json()
+                                        token = response_json.get('access_token')
+                                        
+                                        if token:
+                                            results['tubi_token'] = token
+                                            device_id_from_token = decode_jwt_payload(token)
+                                            if device_id_from_token:
+                                                results['tubi_device_id'] = device_id_from_token
+                                            
+                                            logging.info(f"🔑 Token rögzítve élő elfogással a VÁLASZ testéből! ({token[:10]}...)")
+                                            
+                                    except Exception as e_json:
+                                        # Hiba a response.json() feldolgozásakor (pl. nem JSON)
+                                        logging.debug(f"DEBUG: [TOKEN EXTRACT HIBA] Hiba a válasz JSON feldolgozásakor: {e_json}")
+                                        pass 
+                            except Exception as e_response:
+                                # Playwright hiba (pl. TargetClosedError) a válasz lekérésekor
+                                logging.debug(f"DEBUG: [RESPONSE HIBA] Hiba a válasz lekérésekor: {e_response}")
+                                pass 
+                        
                     await route.continue_() 
 
                 await page.route("**/*", handle_request_token_and_log)
@@ -228,6 +236,12 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
             if target_api_enabled:
                 logging.info("⏳ Kényszerített várakozás 5 másodperc a token rögzítésére.")
                 await page.wait_for_timeout(5000) 
+
+            # --- JAVÍTÁS: Unroute a TargetClosedError elkerülésére ---
+            # Megakadályozza, hogy a háttérben futó útvonal-kezelők leállított környezetet próbáljanak elérni.
+            logging.info("🧹 Playwright útvonal-kezelők leállítása.")
+            await page.unroute_all(behavior='ignoreErrors') 
+            # ----------------------------------------------------
 
             # A NYERS HTML TARTALOM KIMENTÉSE
             try:
@@ -249,6 +263,7 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
                 root_logger.removeHandler(list_handler)
             
             if browser:
+                # A browser.close() már biztonságos az unroute_all hívás után
                 await browser.close()
             logging.info("✅ Playwright befejezve.")
 
@@ -278,13 +293,16 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
                 query_params = parse_qs(url_parsed.query)
                 search_term_raw = query_params.get('search', query_params.get('q', [None]))[0]
                 
+                # Path alapú search_term kinyerése (pl. /search/film-cim)
                 if not search_term_raw and 'search/' in url_parsed.path:
-                     path_segments = url_parsed.path.rstrip('/').split('/')
-                     if path_segments[-2] == 'search':
-                         search_term_raw = path_segments[-1]
+                    path_segments = url_parsed.path.rstrip('/').split('/')
+                    if path_segments[-2] == 'search':
+                        search_term_raw = path_segments[-1]
+                # Bármilyen utolsó path szegmens kinyerése
                 elif not search_term_raw and url_parsed.path:
                     path_segments = url_parsed.path.rstrip('/').split('/')
-                    if len(path_segments) > 0:
+                    # Csak akkor vesszük az utolsó szegmenst, ha az nem root ('' vagy '/') és van tartalom
+                    if len(path_segments) > 1 and path_segments[-1]:
                         search_term_raw = path_segments[-1]
 
                 search_term = unquote(search_term_raw).replace('-', ' ') if search_term_raw else "ismeretlen" 
@@ -335,6 +353,8 @@ def scrape_tubi_endpoint():
     
     logging.info(f"API hívás indítása. Cél URL: {url}. Belső API hívás engedélyezve: {target_api_enabled}.")
 
+    final_data = {}
+
     for attempt in range(1, retry_count + 1):
         logging.info(f"Kísérlet {attempt}/{retry_count} a scrape futtatására. URL: {url} (Belső API engedélyezve: {target_api_enabled})")
         
@@ -352,33 +372,38 @@ def scrape_tubi_endpoint():
              
         # 2. Sikeres Kimenet VAGY Technikai hiba VAGY Nem kérték a token keresést
         
-        # Technikai hiba esetén (pl. Playwright hiba), de nem kértünk TubiTV specifikus adatok
+        # Technikai hiba esetén (pl. Playwright hiba), de nem kértünk TubiTV specifikus adatok, azonnal visszaadjuk.
         if final_data.get('status') == 'failure' and not target_api_enabled:
              logging.info("Visszatérés (Playwright hiba nem TubiTV URL esetén).")
              return jsonify(final_data)
         
         # Ha a target_api_enabled True, de a token/API hívás nem sikerült
-        if target_api_enabled and (final_data.get('tubi_token') is None or final_data.get('tubi_api_data') is None):
+        token_present = final_data.get('tubi_token') is not None
+        api_data_present = final_data.get('tubi_api_data') is not None
+
+        if target_api_enabled and (not token_present or not api_data_present):
              # Folytatjuk az újrapróbálkozást, ha van még esély (a retry_count gondoskodik erről)
-             pass
+             if attempt < retry_count:
+                logging.warning(f"Token/API hiba TubiTV esetén. Újrapróbálkozás {attempt + 1}. kísérlet...")
+                time.sleep(2)
+                continue # Ugrás a következő kísérletre
+             else:
+                # 5. Végső visszatérés hiba esetén (ha kifutott az újrapróbálkozásokból)
+                logging.error("A kért TubiTV adatok nem voltak kinyerhetők az összes kísérlet után sem.")
+                return jsonify(final_data)
 
         # 3. Sikeres Eredmény visszaadása (bármilyen sikeres futtatás)
-        if final_data.get('status') == 'success' and (not target_api_enabled or (final_data.get('tubi_token') and final_data.get('tubi_api_data'))):
+        if final_data.get('status') == 'success' and (not target_api_enabled or (token_present and api_data_present)):
             logging.info(f"Adatok sikeresen kinyerve a(z) {attempt}. kísérletben. Visszatérés JSON-ben.")
             return jsonify(final_data)
         
-        # 4. Újrapróbálkozás (csak ha target_api_enabled és van még kísérlet)
+        # Egyéb, nem várt hiba (pl. status volt success, de még sincs token/API, ami a 3. pont elvileg kezel)
+        # Ez a rész most már nem kellene, hogy fusson, de ha mégis fut, újrapróbálkozik.
         if attempt < retry_count:
-            logging.warning(f"Token/API hiba TubiTV esetén. Újrapróbálkozás {attempt + 1}. kísérlet...")
-            time.sleep(2) 
+            logging.warning(f"Nem várt hiba. Újrapróbálkozás {attempt + 1}. kísérlet...")
+            time.sleep(2)  
         
-        # 5. Végső visszatérés hiba esetén (ha kifutott az újrapróbálkozásokból)
-        if target_api_enabled and attempt == retry_count:
-            logging.error("A kért TubiTV adatok nem voltak kinyerhetők az összes kísérlet után sem.")
-            return jsonify(final_data)
-
-
-    # Végső visszatérés (nem TubiTV, de van valami hiba - elvileg a fenti if-ek kezelik)
+    # Végső visszatérés, ha a ciklus kifutott
     return jsonify(final_data)
 
 
