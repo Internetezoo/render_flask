@@ -21,6 +21,19 @@ app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
 # Fontos: DEBUG szintre állítva a részletes hálózati logokhoz
 logging.basicConfig(level=logging.DEBUG)
 
+# --- ÚJ: LISTHANDLER OSZTÁLY a logok gyűjtésére ---
+class ListHandler(logging.Handler):
+    """Egyéni logger kezelő, amely a logüzeneteket egy listába gyűjti."""
+    def __init__(self, log_list):
+        super().__init__()
+        # Formátum beállítása: LOGLEVEL:LOGGER_NAME:MESSAGE (pl. INFO:root:Oldal betöltése...)
+        self.setFormatter(logging.Formatter('%(levelname)s:%(name)s:%(message)s'))
+        self.log_list = log_list
+
+    def emit(self, record):
+        self.log_list.append(self.format(record))
+# ----------------------------------------------------
+
 # --- KONFIGURÁCIÓS ÁLLANDÓK ---
 MAX_RETRIES = 3 
 DEVICE_ID_HEADER = "X-Tubi-Client-Device-ID"
@@ -50,7 +63,7 @@ def decode_jwt_payload(jwt_token: str) -> Optional[str]:
     try:
         payload_base64 = jwt_token.split('.')[1]
         padding = '=' * (4 - len(payload_base64) % 4)
-        payload_decoded = base64.b64decode(payload_base64 + padding).decode('utf-8')
+        payload_decoded = base64.b64bdecode(payload_base64 + padding).decode('utf-8')
         
         payload_data = json.loads(payload_decoded)
         return payload_data.get('device_id')
@@ -89,7 +102,7 @@ def make_internal_tubi_api_call(search_term: str, token: str, device_id: str, us
 # ASZINKRON PLAYWRIGHT SCRAPE FÜGGVÉNY 
 # ----------------------------------------------------------------------
 
-async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
+async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, simple_log_enabled: bool) -> Dict: 
     """Betölti a Tubi oldalt és élő hálózati forgalom elfogással kinyeri a tokent."""
     
     results = {
@@ -100,8 +113,21 @@ async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
         'user_agent': None,
         'tubi_api_data': None,
         'html_content': None, 
-        'simple_logs': [] # <--- JAVÍTÁS: Kezdeti lista a logoknak
+        'simple_logs': [], # <--- Ezt a kulcsot fogjuk feltölteni a Szerver DEBUG Loggal
+        'har_content': None 
     }
+    
+    # ----------------------------------------------------
+    # ÚJ: Szerver DEBUG Log Fogás Beállítása
+    # ----------------------------------------------------
+    root_logger = logging.getLogger()
+    list_handler = None
+    
+    if simple_log_enabled:
+        list_handler = ListHandler(results['simple_logs'])
+        list_handler.setLevel(logging.DEBUG) 
+        root_logger.addHandler(list_handler)
+    # ----------------------------------------------------
     
     async with async_playwright() as p:
         browser = None
@@ -116,7 +142,13 @@ async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
             results['user_agent'] = user_agent
             
             # 2. A tényleges context létrehozása
-            context = await browser.new_context(locale='en-US', timezone_id='America/New_York') if target_api_enabled else await browser.new_context()
+            har_config = {'path': 'network.har', 'mode': 'minimal'} if har_enabled else {}
+            
+            if target_api_enabled:
+                context = await browser.new_context(locale='en-US', timezone_id='America/New_York', **har_config)
+            else:
+                context = await browser.new_context(**har_config)
+                
             page = await context.new_page()
             page.set_default_timeout(30000)
 
@@ -124,7 +156,7 @@ async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
             async def handle_request_for_token(route: Route):
                 request = route.request
                 
-                # DEBUG: Hálózati forgalom logolása
+                # DEBUG: Hálózati forgalom logolása (ezek kerülnek a server debug logba)
                 if 'tubi' in request.url.lower() or 'device' in request.url.lower():
                      logging.debug(f"DEBUG: [HÁLÓZAT KÉRÉS] {request.method} - URL: {request.url}")
                 
@@ -134,7 +166,6 @@ async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
                 if not results['tubi_token'] and 'authorization' in headers and headers['authorization'].startswith('Bearer'):
                     token = headers['authorization'].split('Bearer ')[1].strip()
                     results['tubi_token'] = token
-                    # JELZI, HOGY MEGTALÁLTA
                     logging.info(f"🔑 Token rögzítve élő elfogással a KÉRÉS fejlécéből. ({token[:10]}...)")
                 
                 if not results['tubi_device_id'] and DEVICE_ID_HEADER.lower() in headers:
@@ -153,12 +184,10 @@ async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
                              
                              if token:
                                  results['tubi_token'] = token
-                                 # Kinyerjük az ID-t a token payloadból
                                  device_id_from_token = decode_jwt_payload(token)
                                  if device_id_from_token:
                                       results['tubi_device_id'] = device_id_from_token
                                  
-                                 # JELZI, HOGY MEGTALÁLTA
                                  logging.info(f"🔑 Token rögzítve élő elfogással a VÁLASZ testéből! ({token[:10]}...)")
                                  
                          except Exception as e:
@@ -167,16 +196,8 @@ async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
 
             await page.route("**/*", handle_request_for_token)
             
-            # --- JAVÍTÁS: Simple Log (konzol) eseménykezelő hozzáadása ---
-            def handle_console(msg):
-                """Konzol üzenetek rögzítése az egyszerűsített logokhoz."""
-                # Csak az egyszerű log és warning üzeneteket rögzítjük
-                if msg.type in ('log', 'warning', 'error', 'info'): 
-                    results['simple_logs'].append(f"[{msg.type.upper()}] {msg.text}")
-                logging.debug(f"DEBUG: [KONZOL LOG] {msg.type.upper()} - {msg.text}")
-
-            page.on("console", handle_console)
-            # --------------------------------------------------------------
+            # ELTÁVOLÍTVA: A browser console log handler (page.on("console", handle_console))
+            # Ehelyett az 5. opció mostantól a Python logokat menti!
             
             # Blokkoljuk a felesleges erőforrásokat
             await page.route("**/google-analytics**", lambda route: route.abort())
@@ -186,11 +207,10 @@ async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
             logging.info("🌐 Oldal betöltése (wait_until='networkidle')...")
             await page.goto(url, wait_until="networkidle", timeout=30000) 
             
-            # NÖVELT VÁRAKOZÁS: Több időt adunk a késleltetett token generáló kérésnek
             logging.info("⏳ Kényszerített várakozás 5 másodperc a token rögzítésére.")
             await page.wait_for_timeout(5000) 
 
-            # --- ÚJ LÉPÉS: A NYERS HTML TARTALOM KIMENTÉSE ---
+            # A NYERS HTML TARTALOM KIMENTÉSE
             try:
                 html_content = await page.content()
                 results['html_content'] = html_content 
@@ -198,7 +218,6 @@ async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
             except Exception as e_content:
                 logging.error(f"❌ Hiba a lap tartalmának (HTML) kimentésekor: {e_content}")
                 results['html_content'] = "ERROR: Failed to retrieve HTML content."
-            # --- ÚJ LÉPÉS VÉGE ---
 
         except Exception as e:
             results['status'] = 'failure'
@@ -206,9 +225,28 @@ async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
             logging.error(f"❌ Playwright hiba: {e}")
             
         finally:
+            # ----------------------------------------------------
+            # Szerver DEBUG Log Fogás Tisztítása
+            # ----------------------------------------------------
+            if list_handler:
+                root_logger.removeHandler(list_handler)
+            # ----------------------------------------------------
+            
             if browser:
                 await browser.close()
             logging.info("✅ Playwright befejezve (élő elfogás).")
+
+            # --- HAR fájl beolvasása és törlése ---
+            if har_enabled:
+                try:
+                    with open('network.har', 'r', encoding='utf-8') as f:
+                        results['har_content'] = json.load(f)
+                    os.remove('network.har')
+                    logging.info("📝 HAR tartalom sikeresen kimentve.")
+                except Exception as e:
+                    logging.error(f"❌ Hiba a HAR mentésekor: {e}")
+                    results['har_content'] = "ERROR: Failed to retrieve HAR content."
+            # ----------------------------------------------------
 
             # 3. Kiegészítés: Device ID kinyerése a tokenből, ha hiányzik
             if results['tubi_token'] and not results['tubi_device_id']:
@@ -217,27 +255,21 @@ async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
                     results['tubi_device_id'] = device_id_from_token
                     logging.info("📱 Device ID kinyerve a token payloadból (Fallback).")
 
-            # 4. Belső API hívás (CSAK ITT TÖRTÉNIK A search_term KINYERÉSE ÉS A VÉGLEGES API HÍVÁS)
+            # 4. Belső API hívás
             if target_api_enabled and results['tubi_token'] and results['tubi_device_id']:
-                # search_term kinyerése az URL-ből
                 url_parsed = urlparse(url)
                 query_params = parse_qs(url_parsed.query)
-                # Ellenőrzi a ?q= vagy a ?search= paramétereket.
                 search_term_raw = query_params.get('search', query_params.get('q', [None]))[0]
                 
-                # Ha nem talál query paramétert, próbálja meg az URL path-jából kinyerni (pl. /search/Ace%20Crawford)
                 if not search_term_raw and 'search/' in url_parsed.path:
-                     # Kinyeri a path utolsó elemét a search után
                      path_segments = url_parsed.path.rstrip('/').split('/')
                      if path_segments[-2] == 'search':
                          search_term_raw = path_segments[-1]
                 elif not search_term_raw and url_parsed.path:
-                    # Kinyerjük a legutolsó path szegmenst (pl. 'police-woman' a /series/300007077/police-woman-ből)
                     path_segments = url_parsed.path.rstrip('/').split('/')
                     if len(path_segments) > 0:
                         search_term_raw = path_segments[-1]
 
-                # Ha még mindig nincs találat, használja az 'ismeretlen' értéket
                 search_term = unquote(search_term_raw).replace('-', ' ') if search_term_raw else "ismeretlen" 
 
                 if search_term and search_term != 'ismeretlen':
@@ -245,7 +277,6 @@ async def scrape_tubitv(url: str, target_api_enabled: bool) -> Dict:
                     results['tubi_api_data'] = tubi_api_data
                     
                     if not tubi_api_data:
-                        # Ez a blokk fog lefutni az 500-as hiba esetén
                         results['status'] = 'failure'
                         results['error'] = 'Sikertelen belső Tubi API hívás a kinyert tokennel.'
                 else:
@@ -263,16 +294,15 @@ def scrape_tubi_endpoint():
     if not url:
         return jsonify({'status': 'failure', 'error': 'Hiányzó "url" paraméter.'}), 400
     
-    # target_api paraméterrel engedélyezzük a belső Tubi API hívást
     target_api_enabled = request.args.get('target_api', '').lower() == 'true'
+    har_enabled = request.args.get('har', '').lower() == 'true'
+    simple_log_enabled = request.args.get('simple_log', '').lower() == 'true' # <-- Az 5. opció paramétere
 
-    # --- JAVÍTÁS: ÚJ VÁLTOZÓK A PONTOS VISSZATÉRÉSI LOGIKÁHOZ ---
     json_outputs_requested = any(
         request.args.get(p, '').lower() == 'true' 
-        for p in ['full_json', 'har', 'console_log', 'simple_log', 'target_api'] # target_api is always JSON
+        for p in ['full_json', 'har', 'simple_log', 'target_api'] # console_log-ot kivettem, mert nem használjuk
     )
     html_requested = request.args.get('html', '').lower() == 'true'
-    # --- VÉGE ---
     
     logging.info(f"API hívás indítása. Cél URL: {url}. Belső API hívás engedélyezve: {target_api_enabled}.")
 
@@ -284,47 +314,35 @@ def scrape_tubi_endpoint():
         logging.info(f"Kísérlet {attempt}/{retry_count} a scrape futtatására. URL: {url} (Belső API engedélyezve: {target_api_enabled})")
         
         loop = asyncio.get_event_loop()
-        final_data = loop.run_until_complete(scrape_tubitv(url, target_api_enabled))
+        final_data = loop.run_until_complete(scrape_tubitv(url, target_api_enabled, har_enabled, simple_log_enabled))
         
-        # --- JAVÍTOTT VISSZATÉRÉSI LOGIKA ---
+        # ... (Visszatérési logika érintetlen)
         
-        # 1. Ha CSAK Tiszta HTML volt kérve (azaz html=true, de a full_json/console_log/stb. mind false)
         is_only_html_requested = html_requested and not json_outputs_requested
         
         if is_only_html_requested and final_data.get('html_content'):
              logging.info("Visszatérés (Sikeres, Tiszta HTML kinyerés).")
-             # A kliens ezt stringként fogja olvasni
              return Response(final_data['html_content'], mimetype='text/html')
-             # -------------------------------------------------------------------
-
-        # 2. Sikeres Kimenet VAGY Technikai hiba VAGY Nem kérték a token keresést
+             
         if final_data.get('status') == 'failure' and not final_data.get('tubi_token'):
-             # Ha technikai hiba volt és tokent sem kaptunk, visszatérés.
              logging.info("Visszatérés (Playwright hiba és token hiánya).")
              return jsonify(final_data)
         
-        # Ha a belső API hívás engedélyezve volt, de az nem sikerült
         if target_api_enabled and final_data.get('tubi_api_data') is None:
-             # Visszatérés a hibával, amit a make_internal_tubi_api_call állított be
              logging.info("Visszatérés (Sikertelen belső API hívás, de a token megvan).")
              return jsonify(final_data)
 
-        # 3. Tubi Token Check (Csak akkor érünk ide, ha sikeres volt a belső API hívás)
-        # Ez a feltétel akkor is igaz lesz, ha a target_api=false, de valamilyen JSON-t kértek (pl. simple_log=true)
         if final_data.get('status') == 'success': 
             logging.info(f"Adatok sikeresen kinyerve a(z) {attempt}. kísérletben. Visszatérés JSON-ben.")
             return jsonify(final_data)
         
-        # 4. Újrapróbálkozás
         if attempt < retry_count:
             logging.warning(f"Token nem található. Újrapróbálkozás {attempt + 1}. kísérlet...")
-            time.sleep(2) # Rövid várakozás
+            time.sleep(2) 
     
-    # Ha a logok/JSON kérése sem sikerült
     logging.error("A kért adatok (logok/JSON) nem voltak kinyerhetők az összes kísérlet után sem.")
     return jsonify(final_data)
 
 
 if __name__ == '__main__':
-    # Helyi futtatáshoz (nem Renderen)
     app.run(host='0.0.0.0', port=os.environ.get('PORT', 5000))
