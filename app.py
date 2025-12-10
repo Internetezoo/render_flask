@@ -6,11 +6,11 @@ import base64
 import os
 import time
 from flask import Flask, request, jsonify, Response
-from playwright.async_api import async_playwright, Route, Response as PlaywrightResponse # Response import megváltozott a konfliktus elkerülése végett
+from playwright.async_api import async_playwright, Route, Response as PlaywrightResponse 
+from urllib.parse import urlparse, parse_qs, unquote
 import requests
 import re
 import urllib.parse
-from urllib.parse import urlparse, parse_qs, unquote
 from typing import Optional, Dict
 
 # Engedélyezi az aszinkron funkciók beágyazását
@@ -185,20 +185,27 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
                     if target_api_enabled:
                         headers = request.headers
                         
-                        # --- 1. Ellenőrzés a KÉRÉS fejlécében ---
+                        # --- 1. Token rögzítése a KÉRÉS fejlécéből ---
                         # Ez a legmegbízhatóbb módszer, mivel minden belső API hívásban szerepel.
                         if not results['tubi_token'] and 'authorization' in headers and headers['authorization'].startswith('Bearer'):
                             token = headers['authorization'].split('Bearer ')[1].strip()
                             results['tubi_token'] = token
                             logging.info(f"🔑 Token rögzítve élő elfogással a KÉRÉS fejlécéből. (TOKEN MÉRET: {len(token)})")
                         
+                        # --- 2. Device ID rögzítése a KÉRÉS fejlécéből ---
                         if not results['tubi_device_id'] and DEVICE_ID_HEADER.lower() in headers:
                             results['tubi_device_id'] = headers[DEVICE_ID_HEADER.lower()]
                             logging.info(f"📱 Device ID rögzítve élő elfogással a KÉRÉS fejlécéből. ({results['tubi_device_id']})")
 
-                        # --- JAVÍTÁS: A VÁLASZ TESTÉNEK KEZELÉSE ELTÁVOLÍTVA AZ ADOTT HIBA ELKERÜLÉSÉRE ---
-                        # A Playwright Response objektum lekérése (await request.response())
-                        # TargetClosedError-t okozhat, ezért erre a mechanizmusra nem hagyatkozunk.
+                        # --- 3. JAVÍTÁS: Device ID rögzítése az URL query paraméterből (Fallback) ---
+                        if not results['tubi_device_id'] and ('tubi.io' in request.url or 'tubitv.com' in request.url):
+                             query_params = parse_qs(urlparse(request.url).query)
+                             device_id_from_url = query_params.get('device_id', [None])[0]
+                             if device_id_from_url:
+                                 results['tubi_device_id'] = device_id_from_url
+                                 logging.info(f"📱 Device ID rögzítve az URL query paraméterből (Fallback). ({results['tubi_device_id']})")
+                        
+                        # --- A VÁLASZ BODY elemzés (amit a TargetClosedError miatt kivettünk) ide nem jön ---
                         
                     await route.continue_() 
 
@@ -211,8 +218,22 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
             await page.goto(url, wait_until="networkidle", timeout=60000) 
             
             if target_api_enabled:
-                logging.info("⏳ Kényszerített várakozás 5 másodperc a token rögzítésére.")
-                await page.wait_for_timeout(5000) 
+                # --- JAVÍTÁS: Robusztus várakozás a token-tartalmú kérésre ---
+                logging.info("⏳ Várakozás egy belső API hívásra, amely tartalmazza az 'Authorization' tokent...")
+                try:
+                    # Keressük az első olyan request-et, aminek van Authorization fejléce
+                    await page.wait_for_request(
+                        lambda req: 'authorization' in req.headers, 
+                        timeout=15000 # 15 másodpercet várunk
+                    )
+                    logging.info("🔑 Token-tartalmú kérés elfogva. Az útvonal-kezelő rögzítette a tokent.")
+                except Exception as e:
+                    # Ha a várakozás időtúllépés miatt bukik, de a token már rögzítve van, az OK.
+                    if not results['tubi_token']:
+                        logging.warning(f"❌ Token-tartalmú kérés nem jött meg a 15 másodperces időtúllépés alatt. Lehet, hogy a token nem került rögzítésre. Hiba: {e}")
+                    else:
+                        logging.info("✅ A token már rögzítve volt a várakozás előtt.")
+                # -------------------------------------------------------------
 
             # --- JAVÍTÁS: Unroute a TargetClosedError elkerülésére ---
             logging.info("🧹 Playwright útvonal-kezelők leállítása.")
@@ -260,11 +281,12 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
 
             # 3. Kiegészítés: Device ID kinyerése a tokenből, ha hiányzik (csak ha target_api_enabled)
             if target_api_enabled:
+                # Ezt a lépést csak akkor futtatjuk, ha a fenti két módszer nem járt sikerrel
                 if results['tubi_token'] and not results['tubi_device_id']:
                     device_id_from_token = decode_jwt_payload(results['tubi_token'])
                     if device_id_from_token:
                         results['tubi_device_id'] = device_id_from_token
-                        logging.info("📱 Device ID kinyerve a token payloadból (Fallback).")
+                        logging.info("📱 Device ID kinyerve a token payloadból (Fallback 2).")
 
             # 4. Belső API hívás (csak ha target_api_enabled)
             if target_api_enabled and results['tubi_token'] and results['tubi_device_id']:
@@ -290,8 +312,6 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
                     results['tubi_api_data'] = tubi_api_data
                     
                     if not tubi_api_data:
-                        # Ha a belső API hívás megbukott, de volt token, akkor a status 'failure' marad, de nem adunk hibaüzenetet,
-                        # mert lehet, hogy a token lejárt vagy az API paraméter rossz.
                         if results['status'] == 'success':
                             results['status'] = 'partial_success'
                         results['error'] = results.get('error', 'Sikertelen belső Tubi API hívás a kinyert tokennel.')
