@@ -6,7 +6,7 @@ import base64
 import os
 import time
 from flask import Flask, request, jsonify, Response
-from playwright.async_api import async_playwright, Route
+from playwright.async_api import async_playwright, Route, Response as PlaywrightResponse # Response import megváltozott a konfliktus elkerülése végett
 import requests
 import re
 import urllib.parse
@@ -70,11 +70,14 @@ def is_tubi_url(url: str) -> bool:
 def decode_jwt_payload(jwt_token: str) -> Optional[str]:
     """Dekódolja a JWT payload részét és kinyeri a device_id-t."""
     try:
+        # A payload a 2. szegmens (index 1)
         payload_base64 = jwt_token.split('.')[1]
+        # Base64 padding hozzáadása
         padding = '=' * (4 - len(payload_base64) % 4)
         payload_decoded = base64.b64bdecode(payload_base64 + padding).decode('utf-8')
         
         payload_data = json.loads(payload_decoded)
+        # Kinyerjük a 'device_id'-t
         return payload_data.get('device_id')
     except Exception as e:
         logging.debug(f"DEBUG: [JWT HIBA] Hiba a JWT dekódolásánál: {e}")
@@ -126,7 +129,7 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
         'har_content': None 
     }
     
-    # Szerver DEBUG Log Fogás Beállítása (5. opció)
+    # Szerver DEBUG Log Fogás Beállítása (5. opcióhoz)
     root_logger = logging.getLogger()
     list_handler = None
     
@@ -138,7 +141,8 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
     async with async_playwright() as p:
         browser = None
         try:
-            browser = await p.chromium.launch(headless=True)
+            # Csökkentett launch timeout a gyorsabb hibakezelés érdekében (ha a böngésző nem indul)
+            browser = await p.chromium.launch(headless=True, timeout=15000) 
             
             # 1. User Agent kinyerése
             temp_context = await browser.new_context() 
@@ -150,19 +154,13 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
             # 2. A tényleges context létrehozása
             har_config = {'path': 'network.har', 'mode': 'minimal'} if har_enabled else {}
             
-            # JAVÍTÁS: ignore_https_errors=True hozzáadása minden kontextushoz az SSL hibák kezelésére
-            if target_api_enabled:
-                context = await browser.new_context(
-                    locale='en-US', 
-                    timezone_id='America/New_York', 
-                    ignore_https_errors=True, 
-                    **har_config
-                )
-            else:
-                context = await browser.new_context(
-                    ignore_https_errors=True, 
-                    **har_config
-                )
+            # ignore_https_errors=True hozzáadása minden kontextushoz az SSL hibák kezelésére
+            context = await browser.new_context(
+                locale='en-US', 
+                timezone_id='America/New_York', 
+                ignore_https_errors=True, 
+                **har_config
+            )
                 
             page = await context.new_page()
             page.set_default_timeout(30000)
@@ -171,9 +169,9 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
 
             # 1. Blokkoljuk a felesleges erőforrásokat
             await page.route("**/google-analytics**", lambda route: route.abort())
-            await page.route(lambda url: url.lower().endswith(('.png', '.jpg', '.gif', '.css', '.woff2')), lambda route: route.abort())
+            await page.route(lambda url: url.lower().endswith(('.png', '.jpg', '.gif', '.css', '.woff2', '.webp')), lambda route: route.abort())
 
-            # Router a forgalom naplózására és a token rögzítésére (Csak ha az 5-ös vagy 6-os opciót kérték)
+            # Router a forgalom naplózására és a token rögzítésére
             if simple_log_enabled or target_api_enabled:
                 
                 async def handle_request_token_and_log(route: Route):
@@ -188,41 +186,19 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
                         headers = request.headers
                         
                         # --- 1. Ellenőrzés a KÉRÉS fejlécében ---
+                        # Ez a legmegbízhatóbb módszer, mivel minden belső API hívásban szerepel.
                         if not results['tubi_token'] and 'authorization' in headers and headers['authorization'].startswith('Bearer'):
                             token = headers['authorization'].split('Bearer ')[1].strip()
                             results['tubi_token'] = token
-                            logging.info(f"🔑 Token rögzítve élő elfogással a KÉRÉS fejlécéből. ({token[:10]}...)")
+                            logging.info(f"🔑 Token rögzítve élő elfogással a KÉRÉS fejlécéből. (TOKEN MÉRET: {len(token)})")
                         
                         if not results['tubi_device_id'] and DEVICE_ID_HEADER.lower() in headers:
                             results['tubi_device_id'] = headers[DEVICE_ID_HEADER.lower()]
                             logging.info(f"📱 Device ID rögzítve élő elfogással a KÉRÉS fejlécéből. ({results['tubi_device_id']})")
 
-                        # --- 2. Ellenőrzés a VÁLASZ testében (token generáló végpont) ---
-                        if not results['tubi_token'] and 'device/anonymous/token' in request.url:
-                            # Ezt a részt érintette a TargetClosedError hiba
-                            try:
-                                response = await request.response() 
-                                if response and response.ok:
-                                    try:
-                                        response_json = await response.json()
-                                        token = response_json.get('access_token')
-                                        
-                                        if token:
-                                            results['tubi_token'] = token
-                                            device_id_from_token = decode_jwt_payload(token)
-                                            if device_id_from_token:
-                                                results['tubi_device_id'] = device_id_from_token
-                                            
-                                            logging.info(f"🔑 Token rögzítve élő elfogással a VÁLASZ testéből! ({token[:10]}...)")
-                                            
-                                    except Exception as e_json:
-                                        # Hiba a response.json() feldolgozásakor (pl. nem JSON)
-                                        logging.debug(f"DEBUG: [TOKEN EXTRACT HIBA] Hiba a válasz JSON feldolgozásakor: {e_json}")
-                                        pass 
-                            except Exception as e_response:
-                                # Playwright hiba (pl. TargetClosedError) a válasz lekérésekor
-                                logging.debug(f"DEBUG: [RESPONSE HIBA] Hiba a válasz lekérésekor: {e_response}")
-                                pass 
+                        # --- JAVÍTÁS: A VÁLASZ TESTÉNEK KEZELÉSE ELTÁVOLÍTVA AZ ADOTT HIBA ELKERÜLÉSÉRE ---
+                        # A Playwright Response objektum lekérése (await request.response())
+                        # TargetClosedError-t okozhat, ezért erre a mechanizmusra nem hagyatkozunk.
                         
                     await route.continue_() 
 
@@ -231,16 +207,19 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
 
             # Betöltjük az oldalt
             logging.info("🌐 Oldal betöltése (wait_until='networkidle')...")
-            await page.goto(url, wait_until="networkidle", timeout=30000) 
+            # Megnövelt navigation timeout az esetleges lassú hálózat miatt
+            await page.goto(url, wait_until="networkidle", timeout=60000) 
             
             if target_api_enabled:
                 logging.info("⏳ Kényszerített várakozás 5 másodperc a token rögzítésére.")
                 await page.wait_for_timeout(5000) 
 
             # --- JAVÍTÁS: Unroute a TargetClosedError elkerülésére ---
-            # Megakadályozza, hogy a háttérben futó útvonal-kezelők leállított környezetet próbáljanak elérni.
             logging.info("🧹 Playwright útvonal-kezelők leállítása.")
-            await page.unroute_all(behavior='ignoreErrors') 
+            # Unroute a route() leállítása után kell futnia
+            if simple_log_enabled or target_api_enabled:
+                 # Ha a route() regisztrálva volt, unroute_all-t hívunk
+                await page.unroute_all(behavior='ignoreErrors') 
             # ----------------------------------------------------
 
             # A NYERS HTML TARTALOM KIMENTÉSE
@@ -263,8 +242,8 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
                 root_logger.removeHandler(list_handler)
             
             if browser:
-                # A browser.close() már biztonságos az unroute_all hívás után
-                await browser.close()
+                 # A context.close() automatikusan zárja a böngészőt, ha nincs más context
+                 await browser.close()
             logging.info("✅ Playwright befejezve.")
 
             # --- HAR fájl beolvasása és törlése ---
@@ -301,7 +280,6 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
                 # Bármilyen utolsó path szegmens kinyerése
                 elif not search_term_raw and url_parsed.path:
                     path_segments = url_parsed.path.rstrip('/').split('/')
-                    # Csak akkor vesszük az utolsó szegmenst, ha az nem root ('' vagy '/') és van tartalom
                     if len(path_segments) > 1 and path_segments[-1]:
                         search_term_raw = path_segments[-1]
 
@@ -312,12 +290,15 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
                     results['tubi_api_data'] = tubi_api_data
                     
                     if not tubi_api_data:
-                        results['status'] = 'failure'
-                        results['error'] = 'Sikertelen belső Tubi API hívás a kinyert tokennel.'
+                        # Ha a belső API hívás megbukott, de volt token, akkor a status 'failure' marad, de nem adunk hibaüzenetet,
+                        # mert lehet, hogy a token lejárt vagy az API paraméter rossz.
+                        if results['status'] == 'success':
+                            results['status'] = 'partial_success'
+                        results['error'] = results.get('error', 'Sikertelen belső Tubi API hívás a kinyert tokennel.')
                 else:
                     logging.warning(f"Nem talált search paramétert az URL-ben a belső API híváshoz. Alapértelmezett: '{search_term}'")
 
-        return results
+            return results
 
 # ----------------------------------------------------------------------
 # FLASK ÚTVONAL KEZELÉS 
@@ -366,42 +347,47 @@ def scrape_tubi_endpoint():
         # 1. Ha CSAK Tiszta HTML volt kérve
         is_only_html_requested = html_requested and not json_outputs_requested
         
-        if is_only_html_requested and final_data.get('html_content'):
-             logging.info("Visszatérés (Sikeres, Tiszta HTML kinyerés).")
-             return Response(final_data['html_content'], mimetype='text/html')
-             
+        if is_only_html_requested and final_data.get('html_content') and final_data.get('status') == 'success':
+              logging.info("Visszatérés (Sikeres, Tiszta HTML kinyerés).")
+              return Response(final_data['html_content'], mimetype='text/html')
+              
         # 2. Sikeres Kimenet VAGY Technikai hiba VAGY Nem kérték a token keresést
         
         # Technikai hiba esetén (pl. Playwright hiba), de nem kértünk TubiTV specifikus adatok, azonnal visszaadjuk.
         if final_data.get('status') == 'failure' and not target_api_enabled:
-             logging.info("Visszatérés (Playwright hiba nem TubiTV URL esetén).")
-             return jsonify(final_data)
+              logging.info("Visszatérés (Playwright hiba nem TubiTV URL esetén).")
+              return jsonify(final_data)
         
         # Ha a target_api_enabled True, de a token/API hívás nem sikerült
         token_present = final_data.get('tubi_token') is not None
         api_data_present = final_data.get('tubi_api_data') is not None
 
         if target_api_enabled and (not token_present or not api_data_present):
-             # Folytatjuk az újrapróbálkozást, ha van még esély (a retry_count gondoskodik erről)
-             if attempt < retry_count:
-                logging.warning(f"Token/API hiba TubiTV esetén. Újrapróbálkozás {attempt + 1}. kísérlet...")
-                time.sleep(2)
-                continue # Ugrás a következő kísérletre
-             else:
-                # 5. Végső visszatérés hiba esetén (ha kifutott az újrapróbálkozásokból)
-                logging.error("A kért TubiTV adatok nem voltak kinyerhetők az összes kísérlet után sem.")
-                return jsonify(final_data)
+              # Folytatjuk az újrapróbálkozást, ha van még esély (a retry_count gondoskodik erről)
+              if attempt < retry_count:
+                  logging.warning(f"Token/API hiba TubiTV esetén. Újrapróbálkozás {attempt + 1}. kísérlet...")
+                  # Növeljük a sleep-et, mert a token generálás időt vehet igénybe
+                  time.sleep(3) 
+                  continue # Ugrás a következő kísérletre
+              else:
+                  # 5. Végső visszatérés hiba esetén (ha kifutott az újrapróbálkozásokból)
+                  logging.error("A kért TubiTV adatok nem voltak kinyerhetők az összes kísérlet után sem.")
+                  return jsonify(final_data)
 
         # 3. Sikeres Eredmény visszaadása (bármilyen sikeres futtatás)
         if final_data.get('status') == 'success' and (not target_api_enabled or (token_present and api_data_present)):
-            logging.info(f"Adatok sikeresen kinyerve a(z) {attempt}. kísérletben. Visszatérés JSON-ben.")
-            return jsonify(final_data)
+              logging.info(f"Adatok sikeresen kinyerve a(z) {attempt}. kísérletben. Visszatérés JSON-ben.")
+              return jsonify(final_data)
         
-        # Egyéb, nem várt hiba (pl. status volt success, de még sincs token/API, ami a 3. pont elvileg kezel)
-        # Ez a rész most már nem kellene, hogy fusson, de ha mégis fut, újrapróbálkozik.
-        if attempt < retry_count:
-            logging.warning(f"Nem várt hiba. Újrapróbálkozás {attempt + 1}. kísérlet...")
-            time.sleep(2)  
+        # 4. Ha volt Playwright hiba, de nem TubiTV URL-re hívtuk (itt már nem futna le a fenti logika miatt)
+        if final_data.get('status') == 'failure' and target_api_enabled:
+             # Ha TubiTV-nél bukott el, de már kifutottunk a kísérletekből (ezt a fenti if blokk is kezeli, de biztonság kedvéért)
+            if attempt == retry_count:
+                logging.error("A kért TubiTV adatok nem voltak kinyerhetők Playwright hiba miatt az összes kísérlet után sem.")
+                return jsonify(final_data)
+            # Egyébként mehet az újrapróbálkozás.
+            logging.warning(f"Playwright hiba TubiTV esetén. Újrapróbálkozás {attempt + 1}. kísérlet...")
+            time.sleep(3)
         
     # Végső visszatérés, ha a ciklus kifutott
     return jsonify(final_data)
