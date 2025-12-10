@@ -70,19 +70,22 @@ def is_tubi_url(url: str) -> bool:
         return False
 
 def decode_jwt_payload(jwt_token: str) -> Optional[str]:
-    """Dekódolja a JWT payload részét és kinyeri a device_id-t."""
+    """Dekódolja a JWT payload részét és kinyeri a device_id-t. JAVÍTVA: b64bdecode -> b64decode"""
     try:
         # A payload a 2. szegmens (index 1)
         payload_base64 = jwt_token.split('.')[1]
         # Base64 padding hozzáadása
         padding = '=' * (4 - len(payload_base64) % 4)
-        payload_decoded = base64.b64bdecode(payload_base64 + padding).decode('utf-8')
+        
+        # JAVÍTÁS: base64.b64bdecode helyett a standard base64.b64decode-ot használjuk
+        payload_decoded = base64.b64decode(payload_base64 + padding).decode('utf-8')
         
         payload_data = json.loads(payload_decoded)
         # Kinyerjük a 'device_id'-t
         return payload_data.get('device_id')
     except Exception as e:
-        logging.debug(f"DEBUG: [JWT HIBA] Hiba a JWT dekódolásánál: {e}")
+        # A felhasználó logjában szereplő hiba kezelése
+        logging.debug(f"DEBUG: [JWT HIBA] Hiba a JWT dekódolásánál: {e}") 
         return None
 
 def make_internal_tubi_api_call(search_term: str, token: str, device_id: str, user_agent: str) -> Optional[Dict]:
@@ -184,7 +187,9 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
 
             # 1. Blokkoljuk a felesleges erőforrásokat
             await page.route("**/google-analytics**", lambda route: route.abort())
-            await page.route(lambda url: url.lower().endswith(('.png', '.jpg', '.gif', '.css', '.woff2', '.webp')), lambda route: route.abort())
+            # Statikus fájlok blokkolása, hogy ne várjon rájuk a hálózat lecsendesedése
+            await page.route(lambda url: url.lower().endswith(('.png', '.jpg', '.gif', '.css', '.woff2', '.webp')) or 'md0.tubitv.com/web-k8s/dist' in url.lower(), lambda route: route.abort())
+
 
             # Router a forgalom naplózására és a token rögzítésére
             if simple_log_enabled or target_api_enabled:
@@ -226,12 +231,14 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
             # --- ROUTE BLOKKOLÁS ÉS KEZELÉS VÉGE ---
 
             # Betöltjük az oldalt
-            logging.info("🌐 Oldal betöltése (wait_until='networkidle')...")
+            # KRITIKUS JAVÍTÁS: networkidle helyett domcontentloaded, hogy ne várjon feleslegesen a hálózat lecsendesedésére.
+            logging.info("🌐 Oldal betöltése (wait_until='domcontentloaded')...")
             # Megnövelt navigation timeout az esetleges lassú hálózat miatt
-            await page.goto(url, wait_until="networkidle", timeout=60000) 
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000) 
             
             if target_api_enabled:
                 # --- JAVÍTÁS: Robusztus várakozás a tokenre (Polling) ---
+                # A domcontentloaded gyorsan visszatér, utána van időnk várni a tokenre.
                 logging.info("⏳ Várakozás a token rögzítésére (Polling módszer, max. 15 másodperc)...")
                 token_found = await wait_for_token(results, timeout=15)
                 
@@ -329,7 +336,7 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
 
 @app.route('/scrape', methods=['GET'])
 def scrape_tubi_endpoint():
-    # ... (a Flask endpoint kódja változatlan, az újrapróbálkozási logika továbbra is a helyén van) ...
+    # ... (a Flask endpoint többi része változatlan) ...
     url = request.args.get('url')
     if not url:
         return jsonify({'status': 'failure', 'error': 'Hiányzó "url" paraméter.'}), 400
