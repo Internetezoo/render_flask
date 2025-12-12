@@ -32,7 +32,7 @@ class ListHandler(logging.Handler):
 
     def emit(self, record):
         if record.levelno >= logging.DEBUG:
-             self.log_list.append(self.format(record))
+            self.log_list.append(self.format(record))
 # ------------------------------------------------------------------
 
 # --- KONFIGURÁCIÓS ÁLLANDÓK ---
@@ -79,8 +79,8 @@ def extract_content_id_from_url(url: str) -> Optional[str]:
     url_parsed = urlparse(url)
     path_segments = url_parsed.path.rstrip('/').split('/')
     for segment in reversed(path_segments):
-         if segment.isdigit():
-             return segment
+        if segment.isdigit():
+            return segment
     return None
 
 def is_tubi_url(url: str) -> bool:
@@ -123,6 +123,7 @@ def make_paginated_tubi_api_call(
         "User-Agent": user_agent,
         DEVICE_ID_HEADER: device_id,
         "Accept": "application/json",
+        # Referer fejlécre itt nincs szükség, mert ugyanaz az IP hívja.
     }
 
     for page_num in range(1, max_pages + 1):
@@ -222,8 +223,21 @@ def make_internal_tubi_api_call(api_type: str, url: str, content_id: Optional[st
         logging.error(f"Belső {api_name} API hívási hiba: {e}")
         return None
 
+# ... (a többi segédfüggvény és scrape_tubitv változatlan maradhat, a token kinyerés a lényeg) ...
+
+async def wait_for_token(results: Dict, timeout: int = 15, interval: float = 0.5) -> bool:
+    """Várakozik a 'tubi_token' megjelenésére a 'results' szótárban, polling módszerrel."""
+    start_time = time.time()
+    
+    while time.time() - start_time < timeout:
+        if results.get('tubi_token'):
+            return True
+        await asyncio.sleep(interval)
+        
+    return False
+
 # ----------------------------------------------------------------------
-# ASZINKRON PLAYWRIGHT SCRAPE FÜGGVÉNY (wait_for_token eltávolítva)
+# ASZINKRON PLAYWRIGHT SCRAPE FÜGGVÉNY - MÓDOSÍTOTT VÁRAKOZÁSI IDŐ
 # ----------------------------------------------------------------------
 
 async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, simple_log_enabled: bool, api_type: str) -> Dict: 
@@ -241,8 +255,6 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
         'har_content': None 
     }
     
-    # ... (A logikának folytatódnia kell, a rövidítés miatt kihagyva) ...
-    
     root_logger = logging.getLogger()
     list_handler = None
     
@@ -254,11 +266,12 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
     async with async_playwright() as p:
         browser = None
         try:
+            # ... (Playwright inicializáció és futás - a felhasználó által biztosított kód) ...
             
             browser = await p.chromium.launch(headless=True, timeout=15000) 
             
             temp_context = await browser.new_context() 
-            temp_page = await browser.new_page() 
+            temp_page = await temp_context.new_page() 
             user_agent = await temp_page.evaluate('navigator.userAgent')
             await temp_context.close()
             results['user_agent'] = user_agent
@@ -313,13 +326,17 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
             # --- ROUTE BLOKKOLÁS ÉS KEZELÉS VÉGE ---
 
             logging.info("🌐 Oldal betöltése (wait_until='domcontentloaded')...")
-            # VÁLTOZTATÁS: Timeout csökkentése 60000ms-ról 15000ms-ra (15 másodperc)
-            await page.goto(url, wait_until="domcontentloaded", timeout=15000) 
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000) 
             
             if target_api_enabled:
-                # VÁLTOZTATÁS: Az ismételt és lassító wait_for_token polling eltávolítva
-                if not results.get('tubi_token'):
-                    logging.warning("❌ A token nem került rögzítésre a 15 másodperces várakozási időn belül.")
+                # *** MÓDOSÍTÁS: 15 másodpercről 60 másodpercre növelve a megbízhatóság érdekében ***
+                logging.info("⏳ Várakozás a token rögzítésére (Polling módszer, max. 60 másodperc)...")
+                token_found = await wait_for_token(results, timeout=60)
+                
+                if token_found:
+                    logging.info("🔑 Token sikeresen rögzítve a várakozási ciklusban.")
+                elif not results.get('tubi_token'):
+                    logging.warning("❌ A token nem került rögzítésre a 60 másodperces várakozási időn belül.")
 
             logging.info("🧹 Playwright útvonal-kezelők leállítása.")
             if simple_log_enabled or target_api_enabled:
@@ -344,7 +361,7 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
                 root_logger.removeHandler(list_handler)
             
             if browser:
-                 await browser.close()
+                await browser.close()
             logging.info("✅ Playwright befejezve.")
 
             # ... (HAR fájl beolvasása és törlése - Változatlan) ...
@@ -366,11 +383,11 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
                     if device_id_from_token:
                         results['tubi_device_id'] = device_id_from_token
                         logging.info("📱 Device ID kinyerve a token payloadból (Fallback 2).")
-    
+            
             return results
 
 # ----------------------------------------------------------------------
-# FLASK ÚTVONAL KEZELÉS - MODOSÍTOTT
+# FLASK ÚTVONAL KEZELÉS - MÓDOSÍTOTT A MÁSODIK FUTÁS ELKERÜLÉSÉHEZ
 # ----------------------------------------------------------------------
 
 @app.route('/scrape', methods=['GET'])
@@ -403,10 +420,10 @@ def scrape_tubi_endpoint():
         should_retry_for_token = False
     
     # Ha évadletöltés kérése érkezik, akkor biztosan engedélyezzük az API hívást, 
-    # mivel a kliens erre a célra hívja meg a tokent és a device_id-t a szerverről.
     if is_season_download:
         target_api_enabled = True
-        should_retry_for_token = False # Csak 1 kísérlet a token kinyerésére
+        # Ha évadletöltés van, a tokennek meg kell lennie elsőre, a Playwright ne retry-zzon.
+        should_retry_for_token = False 
 
     retry_count = MAX_RETRIES if should_retry_for_token else 1 
 
@@ -427,11 +444,15 @@ def scrape_tubi_endpoint():
         
         token_present = final_data.get('tubi_token') is not None
         device_id_present = final_data.get('tubi_device_id') is not None
-        api_data_present = final_data.get('tubi_api_data') is not None
+        
+        # --- ÉVAD LETÖLTÉS LOGIKA ---
+        if is_season_download:
+            if not (token_present and device_id_present):
+                 # Hibás token/device_id kinyerés a szerveren
+                 final_data['status'] = 'failure'
+                 final_data['error'] = 'Token/Device ID kinyerése sikertelen az évadletöltéshez.'
+                 return jsonify(final_data) # Megszakítjuk a Playwright retry-t.
 
-        # --- ÉVAD LETÖLTÉS LOGIKA (Ha a paraméterek be vannak állítva) ---
-        if is_season_download and token_present and device_id_present:
-            
             try:
                 season_num = int(season_num_str)
                 max_pages = int(max_pages_str)
@@ -446,7 +467,7 @@ def scrape_tubi_endpoint():
                 final_data['error'] = 'Hiányzó Content ID az URL-ből az évadletöltéshez.'
                 return jsonify(final_data)
 
-            # A TÖBBLAPOS API HÍVÁS INNEN INDUL (ugyanazon a szerver IP-n belül)
+            # A TÖBBLAPOS API HÍVÁS INNEN INDUL
             paginated_data = make_paginated_tubi_api_call(
                 content_id=content_id, 
                 token=final_data['tubi_token'], 
@@ -467,41 +488,68 @@ def scrape_tubi_endpoint():
                  final_data['error'] = final_data.get('error', 'Sikertelen Content API hívás a szerveren (valószínűleg 403-as hiba).')
                  
             return jsonify(final_data)
-        
-        elif is_season_download and not token_present:
-             # Hibás token/device_id kinyerés a szerveren
-             final_data['status'] = 'failure'
-             final_data['error'] = 'Token/Device ID kinyerése sikertelen az évadletöltéshez.'
-             return jsonify(final_data)
         # --- ÉVAD LETÖLTÉS LOGIKA VÉGE ---
 
+        # ---------------------------------------------------------------
+        # *** MÓDOSÍTÁS: S1 METADATA LOGIKA - API HÍVÁS BEILLESZTÉSE ***
+        # Ez az ág csak akkor fut le, ha NEM évadletöltés van (is_season_download=False).
+        # ---------------------------------------------------------------
+        if target_api_enabled and token_present:
+            
+            content_id = extract_content_id_from_url(url)
+            
+            if content_id or api_type == 'search': # A kereséshez nem kell content_id
+                logging.info(f"🔑 Token rögzítve. Belső {api_type.upper()} API hívás indítása S1 metaadatokért.")
+                api_result = make_internal_tubi_api_call(
+                    api_type=api_type, 
+                    url=url, 
+                    content_id=content_id, 
+                    token=final_data['tubi_token'], 
+                    device_id=final_data['tubi_device_id'], 
+                    user_agent=final_data.get('user_agent', 'Mozilla/5.0')
+                )
+                final_data['tubi_api_data'] = api_result
+                api_data_present = api_result is not None
+                
+            # Ha az API hívás sikeres volt, azonnal visszatérünk
+            if api_data_present:
+                final_data['status'] = 'success'
+                return jsonify(final_data)
+            
+            # Ha a token megvan, de az API hívás sikertelen volt (403), akkor is visszatérünk,
+            # nincs szükség új Playwright futásra.
+            if not api_data_present:
+                 final_data['status'] = 'partial_success' 
+                 final_data['error'] = final_data.get('error', f"Token rögzítve, de {api_type.upper()} API hívás sikertelen (valószínűleg 403-as hiba).")
+                 return jsonify(final_data)
 
-        # --- DEFAULT S1 METADATA LOGIKA (Változatlan) ---
+
+        # --- DEFAULT VISSZATÉRÉSI ÉS RETRY LOGIKA (módosítva) ---
+        
+        # 1. Ha csak HTML-t kért és sikeres volt (target_api_enabled=False)
         is_only_html_requested = html_requested and not json_outputs_requested
         
         if is_only_html_requested and final_data.get('html_content') and final_data.get('status') == 'success':
               return Response(final_data['html_content'], mimetype='text/html')
-            
+              
+        # 2. Ha Playwright hiba volt (target_api_enabled=False)
         if final_data.get('status') == 'failure' and not target_api_enabled:
               return jsonify(final_data)
         
-        # A token/adat ellenőrzés a csökkentett időtúllépés miatt mostantól 15 másodperc után visszatér
-        if target_api_enabled and (not token_present or not api_data_present):
-              if attempt < retry_count:
-                  time.sleep(3) 
-                  continue
-              else:
-                  return jsonify(final_data)
-
-        if final_data.get('status') == 'success' and (not target_api_enabled or (token_present and api_data_present)):
-              return jsonify(final_data)
-        
-        if final_data.get('status') == 'failure' and target_api_enabled:
-            if attempt == retry_count:
+        # 3. Playwright retry csak akkor, ha target_api_enabled=True ÉS HIÁNYZIK a token
+        if target_api_enabled and not token_present:
+            if attempt < retry_count:
+                logging.warning(f"Ismétlés: Hiányzó token. {3 * (retry_count - attempt)} másodperc maradt.")
+                time.sleep(3) 
+                continue
+            else:
+                # Elértük a max retry-t, visszatérünk a végső adattal (ami valószínűleg hiba)
                 return jsonify(final_data)
-            time.sleep(3)
         
-    return jsonify(final_data)
+        # 4. Ha az összes feltételnek megfelel, de fent még nem tért vissza (Pl. ha target_api_enabled=False de json kérés volt)
+        return jsonify(final_data) 
+        
+    return jsonify(final_data) # Ez a végső fallback
 
 
 if __name__ == '__main__':
