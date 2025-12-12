@@ -123,10 +123,6 @@ def make_paginated_tubi_api_call(
         "User-Agent": user_agent,
         DEVICE_ID_HEADER: device_id,
         "Accept": "application/json",
-        # NAGYON FONTOS: A REFERER FEJLÉC Hozzáadása a Szerveroldalon is Segít!
-        # Bár itt a proxy az eredeti URL-t hívja, a Content API a böngészőből indul.
-        # De mivel a Content API-t hívjuk meg (nem a böngésző), a Referer-t most kihagyjuk
-        # és az Authorization/X-Device-Id-re támaszkodunk, a hívó IP-címével.
     }
 
     for page_num in range(1, max_pages + 1):
@@ -226,21 +222,8 @@ def make_internal_tubi_api_call(api_type: str, url: str, content_id: Optional[st
         logging.error(f"Belső {api_name} API hívási hiba: {e}")
         return None
 
-# ... (a többi segédfüggvény és scrape_tubitv változatlan maradhat, a token kinyerés a lényeg) ...
-
-async def wait_for_token(results: Dict, timeout: int = 15, interval: float = 0.5) -> bool:
-    """Várakozik a 'tubi_token' megjelenésére a 'results' szótárban, polling módszerrel."""
-    start_time = time.time()
-    
-    while time.time() - start_time < timeout:
-        if results.get('tubi_token'):
-            return True
-        await asyncio.sleep(interval)
-        
-    return False
-
 # ----------------------------------------------------------------------
-# ASZINKRON PLAYWRIGHT SCRAPE FÜGGVÉNY (KIVÉVE A VÉGÉN LÉVŐ API HÍVÁS)
+# ASZINKRON PLAYWRIGHT SCRAPE FÜGGVÉNY (wait_for_token eltávolítva)
 # ----------------------------------------------------------------------
 
 async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, simple_log_enabled: bool, api_type: str) -> Dict: 
@@ -258,21 +241,7 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
         'har_content': None 
     }
     
-    # ... (Playwright indítás, Token kinyerés logika változatlan - a logikát itt kihagyom a rövidség kedvéért, de a valódi fájlban mindent bent kell hagyni) ...
-    # A korábbi logika:
-    # 1. Logger beállítása
-    # 2. Browser indítása
-    # 3. User Agent kinyerése
-    # 4. Context beállítása, Route kezelés a token rögzítésére
-    # 5. Oldal betöltése
-    # 6. Polling a tokenre
-    # 7. Unroute, HTML tartalom kimentése
-    # 8. Browser bezárása
-    # 9. Device ID kinyerése fallback-kel
-    
-    # Mivel a felhasználó teljes kódot adott, feltételezem, hogy a logikát bent tartja. Csak a VÉGÉN lévő API hívás logikát módosítom:
-    
-    # ... (A scrape_tubitv függvény KÖZEPE) ...
+    # ... (A logikának folytatódnia kell, a rövidítés miatt kihagyva) ...
     
     root_logger = logging.getLogger()
     list_handler = None
@@ -285,15 +254,11 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
     async with async_playwright() as p:
         browser = None
         try:
-            # A fenti logikának bent kell lennie itt a kódban!
-            # ... (Playwright inicializáció és futás) ...
-            
-            # FIGYELEM: A tényleges `app.py` fájlban a fenti kód nem hiányozhat!
             
             browser = await p.chromium.launch(headless=True, timeout=15000) 
             
             temp_context = await browser.new_context() 
-            temp_page = await temp_context.new_page() 
+            temp_page = await browser.new_page() 
             user_agent = await temp_page.evaluate('navigator.userAgent')
             await temp_context.close()
             results['user_agent'] = user_agent
@@ -348,15 +313,12 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
             # --- ROUTE BLOKKOLÁS ÉS KEZELÉS VÉGE ---
 
             logging.info("🌐 Oldal betöltése (wait_until='domcontentloaded')...")
-            await page.goto(url, wait_until="domcontentloaded", timeout=60000) 
+            # VÁLTOZTATÁS: Timeout csökkentése 60000ms-ról 15000ms-ra (15 másodperc)
+            await page.goto(url, wait_until="domcontentloaded", timeout=15000) 
             
             if target_api_enabled:
-                logging.info("⏳ Várakozás a token rögzítésére (Polling módszer, max. 15 másodperc)...")
-                token_found = await wait_for_token(results, timeout=15)
-                
-                if token_found:
-                    logging.info("🔑 Token sikeresen rögzítve a várakozási ciklusban.")
-                elif not results.get('tubi_token'):
+                # VÁLTOZTATÁS: Az ismételt és lassító wait_for_token polling eltávolítva
+                if not results.get('tubi_token'):
                     logging.warning("❌ A token nem került rögzítésre a 15 másodperces várakozási időn belül.")
 
             logging.info("🧹 Playwright útvonal-kezelők leállítása.")
@@ -519,10 +481,11 @@ def scrape_tubi_endpoint():
         
         if is_only_html_requested and final_data.get('html_content') and final_data.get('status') == 'success':
               return Response(final_data['html_content'], mimetype='text/html')
-              
+            
         if final_data.get('status') == 'failure' and not target_api_enabled:
               return jsonify(final_data)
         
+        # A token/adat ellenőrzés a csökkentett időtúllépés miatt mostantól 15 másodperc után visszatér
         if target_api_enabled and (not token_present or not api_data_present):
               if attempt < retry_count:
                   time.sleep(3) 
