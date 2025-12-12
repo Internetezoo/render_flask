@@ -7,7 +7,8 @@ import base64
 import os
 import time
 from flask import Flask, request, jsonify, Response
-from playwright.async_api import async_playwright, Route, Response as PlaywrightResponse 
+# Importáljuk a 'TargetClosedError'-t, hogy a leállítást megfelelően kezeljük
+from playwright.async_api import async_playwright, Route, Response as PlaywrightResponse, Error as PlaywrightError
 from urllib.parse import urlparse, parse_qs, unquote
 import requests
 import re
@@ -19,7 +20,6 @@ nest_asyncio.apply()
 
 app = Flask(__name__)
 app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
-# Fontos: Debug szintről Info szintre váltva, hogy kevesebb legyen a felesleges log
 logging.basicConfig(level=logging.INFO) 
 
 # --- LISTHANDLER OSZTÁLY a logok gyűjtésére (Változatlan) ---
@@ -35,11 +35,9 @@ class ListHandler(logging.Handler):
              self.log_list.append(self.format(record))
 # ------------------------------------------------------------------
 
-# --- KONFIGURÁCIÓS ÁLLANDÓK ---
+# --- KONFIGURÁCIÓS ÁLLANDÓK (Változatlan) ---
 MAX_RETRIES = 3
 DEVICE_ID_HEADER = "X-Tubi-Client-Device-ID"
-
-# 1. Tubi SEARCH API URL TEMPLATE ELŐTAGJA (Változatlan)
 TUBI_SEARCH_API_PREFIX = (
     "https://search.production-public.tubi.io/api/v2/search?"
     "images%5Bposterarts%5D=w408h583_poster&images%5Bhero_422%5D=w422h360_hero&"
@@ -49,16 +47,10 @@ TUBI_SEARCH_API_PREFIX = (
     "images%5Bbackgrounds%5D=w1614h906_background&images%5Btitle_art%5D=w430h180_title&"
     "search="
 )
-
-# 2. Tubi SEARCH API URL TEMPLATE UTÓTAGJA (Változatlan)
 TUBI_SEARCH_API_SUFFIX = (
     "&include_channels=true&include_linear=true&is_kids_mode=false"
 )
-
-# 3. Tubi CONTENT API BASE URL
 TUBI_CONTENT_API_BASE = "https://content-cdn.production-public.tubi.io/api/v2/content"
-
-# 4. Tubi CONTENT API PARAMÉTER SABLON (Paginated hívásokhoz)
 TUBI_CONTENT_API_PARAMS = (
     "app_id=tubitv&platform=web&"
     "content_id={content_id}&device_id={device_id}&"
@@ -72,15 +64,15 @@ TUBI_CONTENT_API_PARAMS = (
     "images%5Bbackgrounds%5D=w1614h906_background&images%5Btitle_art%5D=w430h180_title"
 )
 # ----------------------------------------------------------------------
-# SEGÉDFÜGGVÉNYEK
+# SEGÉDFÜGGVÉNYEK (Változatlan)
 # ----------------------------------------------------------------------
 def extract_content_id_from_url(url: str) -> Optional[str]:
     """Kinyeri a content_id-t a tubitv.com URL path-ból."""
     url_parsed = urlparse(url)
     path_segments = url_parsed.path.rstrip('/').split('/')
     for segment in reversed(path_segments):
-         if segment.isdigit():
-             return segment
+        if segment.isdigit():
+            return segment
     return None
 
 def is_tubi_url(url: str) -> bool:
@@ -103,7 +95,7 @@ def decode_jwt_payload(jwt_token: str) -> Optional[str]:
         logging.debug(f"DEBUG: [JWT HIBA] Hiba a JWT dekódolásánál: {e}") 
         return None
         
-# --- ÚJ: API HÍVÁS PAGINÁLT ÉVADHOZ (A 403-as hiba elkerülése a szerveren) ---
+# --- API HÍVÁS PAGINÁLT ÉVADHOZ (Változatlan) ---
 def make_paginated_tubi_api_call(
     content_id: str, 
     token: str, 
@@ -123,10 +115,6 @@ def make_paginated_tubi_api_call(
         "User-Agent": user_agent,
         DEVICE_ID_HEADER: device_id,
         "Accept": "application/json",
-        # NAGYON FONTOS: A REFERER FEJLÉC Hozzáadása a Szerveroldalon is Segít!
-        # Bár itt a proxy az eredeti URL-t hívja, a Content API a böngészőből indul.
-        # De mivel a Content API-t hívjuk meg (nem a böngésző), a Referer-t most kihagyjuk
-        # és az Authorization/X-Device-Id-re támaszkodunk, a hívó IP-címével.
     }
 
     for page_num in range(1, max_pages + 1):
@@ -149,7 +137,6 @@ def make_paginated_tubi_api_call(
 
         except requests.exceptions.HTTPError as e:
             logging.error(f"❌ S{season_num}/Lap {page_num} API hívási hiba: {e}. Állapotkód: {response.status_code}")
-            # Ha az első lap hibázik (403), a többit nem érdemes hívni
             if page_num == 1:
                 return []
             
@@ -159,14 +146,13 @@ def make_paginated_tubi_api_call(
     return collected_page_data
 # ----------------------------------------------------------------------
 
-# --- RÉGI/DEFAULT API HÍVÁS (Csak az S1 metaadatokhoz) ---
+# --- RÉGI/DEFAULT API HÍVÁS (Csak az S1 metaadatokhoz) - Változatlan ---
 def make_internal_tubi_api_call(api_type: str, url: str, content_id: Optional[str], token: str, device_id: str, user_agent: str) -> Optional[Dict]:
     """A Tubi API-jának hívása a kinyert tokennel (Csak S1/Meta-adatokhoz)."""
     if not token or not device_id:
         logging.error("Hiányzó token vagy device_id a belső API híváshoz.")
         return None
         
-    # Content API Template: A szerver oldalnak be kell szereznie a content_id-t az URL-ből.
     if api_type == 'content':
         if not content_id:
             logging.error("Hiányzó content_id a content API híváshoz.")
@@ -176,9 +162,7 @@ def make_internal_tubi_api_call(api_type: str, url: str, content_id: Optional[st
         full_api_url = f"{TUBI_CONTENT_API_BASE}?{TUBI_CONTENT_API_PARAMS.format(content_id=content_id, device_id=device_id, season_num=1, page_num=1, page_size=50)}"
         api_name = "CONTENT (S1 Metadata)"
 
-    # ... (SEARCH API LOGIKA - Változatlan) ...
     elif api_type == 'search':
-        # ... (Keresés logika változatlan) ...
         url_parsed = urlparse(url)
         search_term_raw = None
 
@@ -208,13 +192,11 @@ def make_internal_tubi_api_call(api_type: str, url: str, content_id: Optional[st
         logging.error(f"Érvénytelen api_type: {api_type}. Támogatott: content, search.")
         return None
 
-    # Összeállítjuk a fejléceket (Változatlan)
     request_headers = {
         "Authorization": f"Bearer {token}",
         "User-Agent": user_agent,
         DEVICE_ID_HEADER: device_id,
         "Accept": "application/json",
-        # Referer fejlécre itt nincs szükség, mert ugyanaz az IP hívja.
     }
 
     try:
@@ -225,9 +207,7 @@ def make_internal_tubi_api_call(api_type: str, url: str, content_id: Optional[st
     except requests.exceptions.RequestException as e:
         logging.error(f"Belső {api_name} API hívási hiba: {e}")
         return None
-
-# ... (a többi segédfüggvény és scrape_tubitv változatlan maradhat, a token kinyerés a lényeg) ...
-
+        
 async def wait_for_token(results: Dict, timeout: int = 15, interval: float = 0.5) -> bool:
     """Várakozik a 'tubi_token' megjelenésére a 'results' szótárban, polling módszerrel."""
     start_time = time.time()
@@ -238,9 +218,8 @@ async def wait_for_token(results: Dict, timeout: int = 15, interval: float = 0.5
         await asyncio.sleep(interval)
         
     return False
-
 # ----------------------------------------------------------------------
-# ASZINKRON PLAYWRIGHT SCRAPE FÜGGVÉNY (KIVÉVE A VÉGÉN LÉVŐ API HÍVÁS)
+# ASZINKRON PLAYWRIGHT SCRAPE FÜGGVÉNY (MÓDOSÍTVA: AZONNALI KILÉPÉS)
 # ----------------------------------------------------------------------
 
 async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, simple_log_enabled: bool, api_type: str) -> Dict: 
@@ -255,24 +234,9 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
         'tubi_api_data': None,
         'html_content': None, 
         'simple_logs': [], 
-        'har_content': None 
+        'har_content': None, 
+        'token_found_early': False # ÚJ KULCS: Jelzi az azonnali leállítást
     }
-    
-    # ... (Playwright indítás, Token kinyerés logika változatlan - a logikát itt kihagyom a rövidség kedvéért, de a valódi fájlban mindent bent kell hagyni) ...
-    # A korábbi logika:
-    # 1. Logger beállítása
-    # 2. Browser indítása
-    # 3. User Agent kinyerése
-    # 4. Context beállítása, Route kezelés a token rögzítésére
-    # 5. Oldal betöltése
-    # 6. Polling a tokenre
-    # 7. Unroute, HTML tartalom kimentése
-    # 8. Browser bezárása
-    # 9. Device ID kinyerése fallback-kel
-    
-    # Mivel a felhasználó teljes kódot adott, feltételezem, hogy a logikát bent tartja. Csak a VÉGÉN lévő API hívás logikát módosítom:
-    
-    # ... (A scrape_tubitv függvény KÖZEPE) ...
     
     root_logger = logging.getLogger()
     list_handler = None
@@ -285,11 +249,7 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
     async with async_playwright() as p:
         browser = None
         try:
-            # A fenti logikának bent kell lennie itt a kódban!
-            # ... (Playwright inicializáció és futás) ...
-            
-            # FIGYELEM: A tényleges `app.py` fájlban a fenti kód nem hiányozhat!
-            
+            # 1. Browser és User Agent Inicializálás (Változatlan)
             browser = await p.chromium.launch(headless=True, timeout=15000) 
             
             temp_context = await browser.new_context() 
@@ -306,11 +266,11 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
                 ignore_https_errors=True, 
                 **har_config
             )
-                
+            
             page = await context.new_page()
             page.set_default_timeout(30000)
 
-            # --- ROUTE BLOKKOLÁS ÉS KEZELÉS ---
+            # 2. ROUTE BLOKKOLÁS ÉS KEZELÉS (Módosítva)
             await page.route("**/google-analytics**", lambda route: route.abort())
             await page.route(lambda url: url.lower().endswith(('.png', '.jpg', '.gif', '.css', '.woff2', '.webp')) or 'md0.tubitv.com/web-k8s/dist' in url.lower(), lambda route: route.abort())
 
@@ -326,11 +286,26 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
                     if target_api_enabled:
                         headers = request.headers
                         
+                        # --- KRITIKUS VÁLTOZTATÁS: AZONNALI LEÁLLÍTÁS TOKEN TALÁLATKOR ---
                         if not results['tubi_token'] and 'authorization' in headers and headers['authorization'].startswith('Bearer'):
                             token = headers['authorization'].split('Bearer ')[1].strip()
                             results['tubi_token'] = token
                             logging.info(f"🔑 Token rögzítve élő elfogással a KÉRÉS fejlécéből. (TOKEN MÉRET: {len(token)})")
-                        
+                            
+                            results['token_found_early'] = True # Jelző beállítása
+                            
+                            # Mivel a page.close() aszinkron, itt kell hívnunk, de a route.continue_() előtt (vagy után), 
+                            # hogy a goto() megszakadjon.
+                            # Először megszakítjuk az összes további útvonalat.
+                            await page.unroute_all(behavior='ignoreErrors')
+                            await route.continue_() # A tokent tartalmazó kérést engedjük el
+                            
+                            # Ez a hívás kivételt fog dobni a page.goto()-ban, de ez a cél.
+                            await page.close() 
+                            return # Visszatérés a route handlerből
+                        # --- VÉGE: AZONNALI LEÁLLÍTÁS LOGIKA ---
+
+                        # Device ID kinyerés (Csak akkor fut le, ha a token még nem volt meg, különben a return már hívva volt)
                         if not results['tubi_device_id'] and DEVICE_ID_HEADER.lower() in headers:
                             results['tubi_device_id'] = headers[DEVICE_ID_HEADER.lower()]
                             logging.info(f"📱 Device ID rögzítve élő elfogással a KÉRÉS fejlécéből. ({results['tubi_device_id']})")
@@ -348,28 +323,43 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
             # --- ROUTE BLOKKOLÁS ÉS KEZELÉS VÉGE ---
 
             logging.info("🌐 Oldal betöltése (wait_until='domcontentloaded')...")
-            await page.goto(url, wait_until="domcontentloaded", timeout=60000) 
             
-            if target_api_enabled:
-                logging.info("⏳ Várakozás a token rögzítésére (Polling módszer, max. 15 másodperc)...")
-                token_found = await wait_for_token(results, timeout=15)
-                
-                if token_found:
-                    logging.info("🔑 Token sikeresen rögzítve a várakozási ciklusban.")
-                elif not results.get('tubi_token'):
-                    logging.warning("❌ A token nem került rögzítésre a 15 másodperces várakozási időn belül.")
-
-            logging.info("🧹 Playwright útvonal-kezelők leállítása.")
-            if simple_log_enabled or target_api_enabled:
-                await page.unroute_all(behavior='ignoreErrors') 
-
+            # 3. page.goto() Futtatása és Hiba Kezelése (Módosítva)
             try:
-                html_content = await page.content()
-                results['html_content'] = html_content 
-                logging.info("📝 A lap tartalmát (HTML) sikeresen kimentette.")
-            except Exception as e_content:
-                logging.error(f"❌ Hiba a lap tartalmának (HTML) kimentésekor: {e_content}")
-                results['html_content'] = "ERROR: Failed to retrieve HTML content."
+                # Az oldal betöltése
+                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                
+            except Exception as e:
+                # Elkapjuk a 'TargetClosedError' (vagy hasonló) kivételt, amit a page.close() okozott
+                if results.get('token_found_early'):
+                    logging.info("⚡ Oldal betöltés megszakítva: A token sikeresen rögzítve (Gyorsítás).")
+                    pass # Sikeres megszakítás
+                else:
+                    # Ez egy valódi navigációs hiba (timeout, navigation error)
+                    # Ha ez egy Playwright hiba, de nem az 'early_exit' jelzés miatt van, akkor visszaadjuk a hibát
+                    if isinstance(e, PlaywrightError):
+                         raise e
+                    else:
+                         # Más Playwright-on kívüli hibát hagyjuk a fő except blokknak elkapni
+                         results['status'] = 'failure'
+                         results['error'] = f"Playwright navigációs hiba: {str(e)}"
+                         logging.error(f"❌ Playwright navigációs hiba: {e}")
+                         
+            # A Polling (wait_for_token) logikát teljesen töröltük, mivel felesleges
+            # ----------------------------------------------------------------------
+            
+            # HTML KIMENTÉS
+            if not results.get('token_found_early'):
+                try:
+                    html_content = await page.content()
+                    results['html_content'] = html_content 
+                    logging.info("📝 A lap tartalmát (HTML) sikeresen kimentette.")
+                except Exception as e_content:
+                    if not results.get('tubi_token'):
+                        logging.error(f"❌ Hiba a lap tartalmának (HTML) kimentésekor: {e_content}")
+                    # Ha a 'token_found_early' igaz, de ide jutunk, valószínűleg a page.close() dobta a hibát,
+                    # de a token megvan.
+                    results['html_content'] = "ERROR: Failed to retrieve HTML content."
 
         except Exception as e:
             results['status'] = 'failure'
@@ -382,20 +372,24 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
                 root_logger.removeHandler(list_handler)
             
             if browser:
-                 await browser.close()
+                # A browser.close() itt is futhat, ha a page.close() sikertelen volt,
+                # de a fő try/except gondoskodik a hibakezelésről.
+                await browser.close()
             logging.info("✅ Playwright befejezve.")
 
             # ... (HAR fájl beolvasása és törlése - Változatlan) ...
             if har_enabled:
-                try:
-                    with open('network.har', 'r', encoding='utf-8') as f:
-                        results['har_content'] = json.load(f)
-                    os.remove('network.har')
-                    logging.info("📝 HAR tartalom sikeresen kimentve.")
-                except Exception as e:
-                    logging.error(f"❌ Hiba a HAR mentésekor: {e}")
-                    results['har_content'] = "ERROR: Failed to retrieve HAR content."
-            # ----------------------------------------------------
+                 try:
+                    if os.path.exists('network.har'):
+                         with open('network.har', 'r', encoding='utf-8') as f:
+                             results['har_content'] = json.load(f)
+                         os.remove('network.har')
+                         logging.info("📝 HAR tartalom sikeresen kimentve.")
+                    else:
+                         results['har_content'] = "HAR file not created (Playwright process stopped early)."
+                 except Exception as e:
+                     logging.error(f"❌ Hiba a HAR mentésekor: {e}")
+                     results['har_content'] = "ERROR: Failed to retrieve HAR content."
 
             # 3. Kiegészítés: Device ID kinyerése a tokenből, ha hiányzik (Fallback 2)
             if target_api_enabled:
@@ -404,11 +398,11 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
                     if device_id_from_token:
                         results['tubi_device_id'] = device_id_from_token
                         logging.info("📱 Device ID kinyerve a token payloadból (Fallback 2).")
-    
+            
             return results
 
 # ----------------------------------------------------------------------
-# FLASK ÚTVONAL KEZELÉS - MODOSÍTOTT
+# FLASK ÚTVONAL KEZELÉS (Változatlan)
 # ----------------------------------------------------------------------
 
 @app.route('/scrape', methods=['GET'])
@@ -440,11 +434,10 @@ def scrape_tubi_endpoint():
         target_api_enabled = False
         should_retry_for_token = False
     
-    # Ha évadletöltés kérése érkezik, akkor biztosan engedélyezzük az API hívást, 
-    # mivel a kliens erre a célra hívja meg a tokent és a device_id-t a szerverről.
+    # Ha évadletöltés kérése érkezik, akkor biztosan engedélyezzük az API hívást
     if is_season_download:
         target_api_enabled = True
-        should_retry_for_token = False # Csak 1 kísérlet a token kinyerésére
+        should_retry_for_token = False 
 
     retry_count = MAX_RETRIES if should_retry_for_token else 1 
 
@@ -466,6 +459,29 @@ def scrape_tubi_endpoint():
         token_present = final_data.get('tubi_token') is not None
         device_id_present = final_data.get('tubi_device_id') is not None
         api_data_present = final_data.get('tubi_api_data') is not None
+
+        # --- S1 METADATA LETÖLTÉS (Ha nem évadletöltés és a token megvan) ---
+        if target_api_enabled and token_present and device_id_present and not is_season_download:
+             
+             content_id = extract_content_id_from_url(url)
+             
+             if not content_id and api_type == 'content':
+                 logging.error("Content ID hiányzik a content API híváshoz.")
+                 final_data['tubi_api_data'] = None
+             else:
+                 api_data = make_internal_tubi_api_call(
+                     api_type=api_type, 
+                     url=url, 
+                     content_id=content_id, 
+                     token=final_data['tubi_token'], 
+                     device_id=final_data['tubi_device_id'], 
+                     user_agent=final_data.get('user_agent', 'Mozilla/5.0')
+                 )
+                 final_data['tubi_api_data'] = api_data
+             
+             api_data_present = final_data.get('tubi_api_data') is not None
+        # --- S1 METADATA LETÖLTÉS VÉGE ---
+
 
         # --- ÉVAD LETÖLTÉS LOGIKA (Ha a paraméterek be vannak állítva) ---
         if is_season_download and token_present and device_id_present:
@@ -501,13 +517,12 @@ def scrape_tubi_endpoint():
                 final_data['status'] = 'success'
                 logging.info(f"✅ Évadletöltés befejezve. {len(paginated_data)} lap visszaküldve a kliensnek.")
             else:
-                 final_data['status'] = 'partial_success' # A token rendben van, de a hívás elutasítva.
+                 final_data['status'] = 'partial_success'
                  final_data['error'] = final_data.get('error', 'Sikertelen Content API hívás a szerveren (valószínűleg 403-as hiba).')
                  
             return jsonify(final_data)
         
         elif is_season_download and not token_present:
-             # Hibás token/device_id kinyerés a szerveren
              final_data['status'] = 'failure'
              final_data['error'] = 'Token/Device ID kinyerése sikertelen az évadletöltéshez.'
              return jsonify(final_data)
@@ -518,26 +533,26 @@ def scrape_tubi_endpoint():
         is_only_html_requested = html_requested and not json_outputs_requested
         
         if is_only_html_requested and final_data.get('html_content') and final_data.get('status') == 'success':
-              return Response(final_data['html_content'], mimetype='text/html')
-              
+             return Response(final_data['html_content'], mimetype='text/html')
+             
         if final_data.get('status') == 'failure' and not target_api_enabled:
-              return jsonify(final_data)
+             return jsonify(final_data)
         
         if target_api_enabled and (not token_present or not api_data_present):
-              if attempt < retry_count:
-                  time.sleep(3) 
-                  continue
-              else:
-                  return jsonify(final_data)
+             if attempt < retry_count:
+                 time.sleep(3) 
+                 continue
+             else:
+                 return jsonify(final_data)
 
         if final_data.get('status') == 'success' and (not target_api_enabled or (token_present and api_data_present)):
-              return jsonify(final_data)
+             return jsonify(final_data)
         
         if final_data.get('status') == 'failure' and target_api_enabled:
             if attempt == retry_count:
                 return jsonify(final_data)
             time.sleep(3)
-        
+            
     return jsonify(final_data)
 
 
