@@ -123,7 +123,6 @@ def make_paginated_tubi_api_call(
         "User-Agent": user_agent,
         DEVICE_ID_HEADER: device_id,
         "Accept": "application/json",
-        # Referer fejlécre itt nincs szükség, mert ugyanaz az IP hívja.
     }
 
     for page_num in range(1, max_pages + 1):
@@ -183,7 +182,7 @@ def make_internal_tubi_api_call(api_type: str, url: str, content_id: Optional[st
         search_term_raw = query_params.get('search', query_params.get('q', [None]))[0]
         
         if not search_term_raw and 'search/' in url_parsed.path:
-            path_segments = url_parsed.path.rstrip('/').split('/')
+            path_segments = urlparse(url).path.rstrip('/').split('/')
             if path_segments[-2] == 'search':
                 search_term_raw = path_segments[-1]
         elif not search_term_raw and url_parsed.path:
@@ -223,21 +222,8 @@ def make_internal_tubi_api_call(api_type: str, url: str, content_id: Optional[st
         logging.error(f"Belső {api_name} API hívási hiba: {e}")
         return None
 
-# ... (a többi segédfüggvény és scrape_tubitv változatlan maradhat, a token kinyerés a lényeg) ...
-
-async def wait_for_token(results: Dict, timeout: int = 15, interval: float = 0.5) -> bool:
-    """Várakozik a 'tubi_token' megjelenésére a 'results' szótárban, polling módszerrel."""
-    start_time = time.time()
-    
-    while time.time() - start_time < timeout:
-        if results.get('tubi_token'):
-            return True
-        await asyncio.sleep(interval)
-        
-    return False
-
 # ----------------------------------------------------------------------
-# ASZINKRON PLAYWRIGHT SCRAPE FÜGGVÉNY - MÓDOSÍTOTT VÁRAKOZÁSI IDŐ
+# ASZINKRON PLAYWRIGHT SCRAPE FÜGGVÉNY - MÓDOSÍTOTT POLLINGGAL
 # ----------------------------------------------------------------------
 
 async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, simple_log_enabled: bool, api_type: str) -> Dict: 
@@ -255,6 +241,11 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
         'har_content': None 
     }
     
+    # ÚJ: A pollinghoz szükséges beállítások
+    MAX_POLL_TIME = 40  # Maximum 40 másodperc az oldalon való tartózkodásra a tokent keresve
+    POLL_INTERVAL = 5   # 5 másodpercenkénti ellenőrzés
+    start_time = time.time() # Időmérés indítása
+    
     root_logger = logging.getLogger()
     list_handler = None
     
@@ -266,12 +257,11 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
     async with async_playwright() as p:
         browser = None
         try:
-            # ... (Playwright inicializáció és futás - a felhasználó által biztosított kód) ...
             
             browser = await p.chromium.launch(headless=True, timeout=15000) 
             
             temp_context = await browser.new_context() 
-            temp_page = await temp_context.new_page() 
+            temp_page = await browser.new_page() 
             user_agent = await temp_page.evaluate('navigator.userAgent')
             await temp_context.close()
             results['user_agent'] = user_agent
@@ -314,11 +304,11 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
                             logging.info(f"📱 Device ID rögzítve élő elfogással a KÉRÉS fejlécéből. ({results['tubi_device_id']})")
 
                         if not results['tubi_device_id'] and ('tubi.io' in request.url or 'tubitv.com' in request.url):
-                             query_params = parse_qs(urlparse(request.url).query)
-                             device_id_from_url = query_params.get('device_id', [None])[0]
-                             if device_id_from_url:
-                                 results['tubi_device_id'] = device_id_from_url
-                                 logging.info(f"📱 Device ID rögzítve az URL query paraméterből (Fallback 1). ({results['tubi_device_id']})")
+                            query_params = parse_qs(urlparse(request.url).query)
+                            device_id_from_url = query_params.get('device_id', [None])[0]
+                            if device_id_from_url:
+                                results['tubi_device_id'] = device_id_from_url
+                                logging.info(f"📱 Device ID rögzítve az URL query paraméterből (Fallback 1). ({results['tubi_device_id']})")
                         
                     await route.continue_() 
 
@@ -326,17 +316,34 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
             # --- ROUTE BLOKKOLÁS ÉS KEZELÉS VÉGE ---
 
             logging.info("🌐 Oldal betöltése (wait_until='domcontentloaded')...")
-            await page.goto(url, wait_until="domcontentloaded", timeout=60000) 
+            # VÁLTOZTATÁS: Timeout csökkentése 60000ms-ról 15000ms-ra (15 másodperc)
+            await page.goto(url, wait_until="domcontentloaded", timeout=15000) 
             
+            
+            # --- ÚJ: 5 MÁSODPERCENKÉNTI TOKEN POLLING ---
             if target_api_enabled:
-                # *** MÓDOSÍTÁS: 15 másodpercről 60 másodpercre növelve a megbízhatóság érdekében ***
-                logging.info("⏳ Várakozás a token rögzítésére (Polling módszer, max. 60 másodperc)...")
-                token_found = await wait_for_token(results, timeout=60)
+                logging.info(f"⏳ Token ellenőrzés indítása {POLL_INTERVAL} másodpercenkénti pollinggal (Max. {MAX_POLL_TIME}s)...")
                 
-                if token_found:
-                    logging.info("🔑 Token sikeresen rögzítve a várakozási ciklusban.")
-                elif not results.get('tubi_token'):
-                    logging.warning("❌ A token nem került rögzítésre a 60 másodperces várakozási időn belül.")
+                while not results.get('tubi_token') and (time.time() - start_time) < MAX_POLL_TIME:
+                    
+                    if results.get('tubi_token'):
+                        logging.info(f"🔑 Token sikeresen kinyerve a {int(time.time() - start_time)} másodperc alatt. Kilépés a pollingból.")
+                        break
+                        
+                    elapsed_time = int(time.time() - start_time)
+                    
+                    if elapsed_time >= MAX_POLL_TIME:
+                        logging.warning(f"❌ Elérte a maximális {MAX_POLL_TIME} másodperces várakozási időt. Kilépés a pollingból.")
+                        break
+                        
+                    logging.debug(f"DEBUG: Token ellenőrzés (Eltelt: {elapsed_time}s / Max: {MAX_POLL_TIME}s). Vár {POLL_INTERVAL} másodpercet...")
+                    # Aszinkron várakozás
+                    await asyncio.sleep(POLL_INTERVAL)
+                
+                if not results.get('tubi_token'):
+                    logging.warning(f"❌ A token nem került rögzítésre a {MAX_POLL_TIME} másodperces várakozási időn belül.")
+            # --- POLLING VÉGE ---
+
 
             logging.info("🧹 Playwright útvonal-kezelők leállítása.")
             if simple_log_enabled or target_api_enabled:
@@ -383,11 +390,11 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
                     if device_id_from_token:
                         results['tubi_device_id'] = device_id_from_token
                         logging.info("📱 Device ID kinyerve a token payloadból (Fallback 2).")
-            
+    
             return results
 
 # ----------------------------------------------------------------------
-# FLASK ÚTVONAL KEZELÉS - MÓDOSÍTOTT A MÁSODIK FUTÁS ELKERÜLÉSÉHEZ
+# FLASK ÚTVONAL KEZELÉS - MODOSÍTOTT
 # ----------------------------------------------------------------------
 
 @app.route('/scrape', methods=['GET'])
@@ -420,12 +427,14 @@ def scrape_tubi_endpoint():
         should_retry_for_token = False
     
     # Ha évadletöltés kérése érkezik, akkor biztosan engedélyezzük az API hívást, 
+    # mivel a kliens erre a célra hívja meg a tokent és a device_id-t a szerverről.
     if is_season_download:
         target_api_enabled = True
-        # Ha évadletöltés van, a tokennek meg kell lennie elsőre, a Playwright ne retry-zzon.
-        should_retry_for_token = False 
+        should_retry_for_token = False # Csak 1 kísérlet a token kinyerésére (a polling miatt)
 
-    retry_count = MAX_RETRIES if should_retry_for_token else 1 
+    # Mivel a pollingot bevezettük, és a polling MAX_POLL_TIME-ig tart, a MAX_RETRIES-t 
+    # beállítjuk 1-re, ha a token kinyerés a cél. (A 40s a Playwright-ban a retry).
+    retry_count = 1 # A belső polling kezeli a várakozást
 
     json_outputs_requested = any(
         request.args.get(p, '').lower() == 'true' 
@@ -444,15 +453,11 @@ def scrape_tubi_endpoint():
         
         token_present = final_data.get('tubi_token') is not None
         device_id_present = final_data.get('tubi_device_id') is not None
-        
-        # --- ÉVAD LETÖLTÉS LOGIKA ---
-        if is_season_download:
-            if not (token_present and device_id_present):
-                 # Hibás token/device_id kinyerés a szerveren
-                 final_data['status'] = 'failure'
-                 final_data['error'] = 'Token/Device ID kinyerése sikertelen az évadletöltéshez.'
-                 return jsonify(final_data) # Megszakítjuk a Playwright retry-t.
+        api_data_present = final_data.get('tubi_api_data') is not None
 
+        # --- ÉVAD LETÖLTÉS LOGIKA (Ha a paraméterek be vannak állítva) ---
+        if is_season_download and token_present and device_id_present:
+            
             try:
                 season_num = int(season_num_str)
                 max_pages = int(max_pages_str)
@@ -467,7 +472,7 @@ def scrape_tubi_endpoint():
                 final_data['error'] = 'Hiányzó Content ID az URL-ből az évadletöltéshez.'
                 return jsonify(final_data)
 
-            # A TÖBBLAPOS API HÍVÁS INNEN INDUL
+            # A TÖBBLAPOS API HÍVÁS INNEN INDUL (ugyanazon a szerver IP-n belül)
             paginated_data = make_paginated_tubi_api_call(
                 content_id=content_id, 
                 token=final_data['tubi_token'], 
@@ -484,72 +489,42 @@ def scrape_tubi_endpoint():
                 final_data['status'] = 'success'
                 logging.info(f"✅ Évadletöltés befejezve. {len(paginated_data)} lap visszaküldve a kliensnek.")
             else:
-                 final_data['status'] = 'partial_success' # A token rendben van, de a hívás elutasítva.
-                 final_data['error'] = final_data.get('error', 'Sikertelen Content API hívás a szerveren (valószínűleg 403-as hiba).')
-                 
+                final_data['status'] = 'partial_success' # A token rendben van, de a hívás elutasítva.
+                final_data['error'] = final_data.get('error', 'Sikertelen Content API hívás a szerveren (valószínűleg 403-as hiba).')
+                
             return jsonify(final_data)
+        
+        elif is_season_download and not token_present:
+             # Hibás token/device_id kinyerés a szerveren
+             final_data['status'] = 'failure'
+             final_data['error'] = 'Token/Device ID kinyerése sikertelen az évadletöltéshez (polling lejárt/sikertelen).'
+             return jsonify(final_data)
         # --- ÉVAD LETÖLTÉS LOGIKA VÉGE ---
 
-        # ---------------------------------------------------------------
-        # *** MÓDOSÍTÁS: S1 METADATA LOGIKA - API HÍVÁS BEILLESZTÉSE ***
-        # Ez az ág csak akkor fut le, ha NEM évadletöltés van (is_season_download=False).
-        # ---------------------------------------------------------------
-        if target_api_enabled and token_present:
-            
-            content_id = extract_content_id_from_url(url)
-            
-            if content_id or api_type == 'search': # A kereséshez nem kell content_id
-                logging.info(f"🔑 Token rögzítve. Belső {api_type.upper()} API hívás indítása S1 metaadatokért.")
-                api_result = make_internal_tubi_api_call(
-                    api_type=api_type, 
-                    url=url, 
-                    content_id=content_id, 
-                    token=final_data['tubi_token'], 
-                    device_id=final_data['tubi_device_id'], 
-                    user_agent=final_data.get('user_agent', 'Mozilla/5.0')
-                )
-                final_data['tubi_api_data'] = api_result
-                api_data_present = api_result is not None
-                
-            # Ha az API hívás sikeres volt, azonnal visszatérünk
-            if api_data_present:
-                final_data['status'] = 'success'
-                return jsonify(final_data)
-            
-            # Ha a token megvan, de az API hívás sikertelen volt (403), akkor is visszatérünk,
-            # nincs szükség új Playwright futásra.
-            if not api_data_present:
-                 final_data['status'] = 'partial_success' 
-                 final_data['error'] = final_data.get('error', f"Token rögzítve, de {api_type.upper()} API hívás sikertelen (valószínűleg 403-as hiba).")
-                 return jsonify(final_data)
 
-
-        # --- DEFAULT VISSZATÉRÉSI ÉS RETRY LOGIKA (módosítva) ---
-        
-        # 1. Ha csak HTML-t kért és sikeres volt (target_api_enabled=False)
+        # --- DEFAULT S1 METADATA LOGIKA (Változatlan) ---
         is_only_html_requested = html_requested and not json_outputs_requested
         
         if is_only_html_requested and final_data.get('html_content') and final_data.get('status') == 'success':
               return Response(final_data['html_content'], mimetype='text/html')
-              
-        # 2. Ha Playwright hiba volt (target_api_enabled=False)
+            
         if final_data.get('status') == 'failure' and not target_api_enabled:
               return jsonify(final_data)
         
-        # 3. Playwright retry csak akkor, ha target_api_enabled=True ÉS HIÁNYZIK a token
-        if target_api_enabled and not token_present:
-            if attempt < retry_count:
-                logging.warning(f"Ismétlés: Hiányzó token. {3 * (retry_count - attempt)} másodperc maradt.")
-                time.sleep(3) 
-                continue
-            else:
-                # Elértük a max retry-t, visszatérünk a végső adattal (ami valószínűleg hiba)
-                return jsonify(final_data)
+        # Ez a rész a target_api-ra vonatkozik, ha NEM évadletöltés történt.
+        # A Playwright alatti polling miatt a külső retry-ra nincs szükség (retry_count=1).
+        if target_api_enabled and (not token_present or not api_data_present):
+              # Mivel a retry_count 1, ez azonnal visszatér, ha a 40 másodperc alatt nem volt siker
+              return jsonify(final_data)
+
+        if final_data.get('status') == 'success' and (not target_api_enabled or (token_present and api_data_present)):
+              return jsonify(final_data)
         
-        # 4. Ha az összes feltételnek megfelel, de fent még nem tért vissza (Pl. ha target_api_enabled=False de json kérés volt)
-        return jsonify(final_data) 
+        # A külső retry logic is leegyszerűsödik 1 kísérletre a belső polling miatt.
+        if final_data.get('status') == 'failure' and target_api_enabled:
+            return jsonify(final_data)
         
-    return jsonify(final_data) # Ez a végső fallback
+    return jsonify(final_data)
 
 
 if __name__ == '__main__':
