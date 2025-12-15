@@ -22,13 +22,13 @@ app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
 # Fontos: Debug szintről Info szintre váltva, hogy kevesebb legyen a felesleges log
 logging.basicConfig(level=logging.INFO) 
 
-# --- LISTHANDLER OSZTÁLY a logok gyűjtésére (Változatlan) ---
+# --- LISTHANDLER OSZTÁLY a logok gyűjtésére (JAVÍTVA) ---
 class ListHandler(logging.Handler):
     """Egyéni logger kezelő, amely a logüzeneteket egy listába gyűjti."""
     def __init__(self, log_list):
         super().__init__()
-        
-self.setFormatter(logging.Formatter('%(levelname)s:%(name)s:%(message)s'))
+        # JAVÍTÁS: A setFormatter metódus behúzása a __init__ metóduson belülre került
+        self.setFormatter(logging.Formatter('%(levelname)s:%(name)s:%(message)s')) 
         self.log_list = log_list
 
     def emit(self, record):
@@ -239,18 +239,11 @@ Támogatott: content, search.")
 
 # ----------------------------------------------------------------------
 # ASZINKRON PLAYWRIGHT SCRAPE FÜGGVÉNY - MÓDOSÍTOTT POLLINGGAL
-# ASZINKRON PLAYWRIGHT SCRAPE FÜGGVÉNY - MÓDOSÍTOTT POLLINGGAL (Változatlan)
 # ----------------------------------------------------------------------
 
-# ... scrape_tubitv függvény változatlan ...
 async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, simple_log_enabled: bool, api_type: str) -> Dict: 
     
   """Betölti az oldalt és kezeli a tokent és a logokat."""
-    # A függvény tartalma változatlan a fenti kódhoz képest.
-# A teljesség kedvéért meg kell tartani a felhasználó által adott teljes kódot
-    # De a kód áttekinthetősége érdekében csak a FLASK útvonalat módosítom.
-# [A scrape_tubitv függvény kódja a felhasználó által megadott módon itt folytatódik...]
-
     results = {
         'status': 'success',
         'url': url,
@@ -507,8 +500,9 @@ def scrape_tubi_endpoint():
             return jsonify({"status": "failure", "error": f"Belső szerver hiba a proxy kezelésekor: {e}"}), 500
     # --- GENERIKUS PROXY POST KÉRÉS KEZELÉS VÉGE ---
 
-    # --- 2. EREDETI TUBI GET KÉRÉS KEZELÉSE (A korábbi logika) ---
+    # --- 2. EREDETI TUBI GET/POST KÉRÉS KEZELÉSE (a /scrape logikája) ---
     
+    # A request.args (query string paraméterek) a GET és a POST kéréseknél is működik Flask-ban.
     url = request.args.get('url')
     if not url:
       
