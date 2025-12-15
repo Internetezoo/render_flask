@@ -223,11 +223,15 @@ def make_internal_tubi_api_call(api_type: str, url: str, content_id: Optional[st
         return None
 
 # ----------------------------------------------------------------------
-# ASZINKRON PLAYWRIGHT SCRAPE FÜGGVÉNY - MÓDOSÍTOTT POLLINGGAL
+# ASZINKRON PLAYWRIGHT SCRAPE FÜGGVÉNY - MÓDOSÍTOTT POLLINGGAL (Változatlan)
 # ----------------------------------------------------------------------
-
+# ... scrape_tubitv függvény változatlan ...
 async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, simple_log_enabled: bool, api_type: str) -> Dict: 
-    """Betölti az oldalt és kezeli a tokent és a logokat."""
+    # A függvény tartalma változatlan a fenti kódhoz képest.
+    # A teljesség kedvéért meg kell tartani a felhasználó által adott teljes kódot
+    # De a kód áttekinthetősége érdekében csak a FLASK útvonalat módosítom.
+    
+    # [A scrape_tubitv függvény kódja a felhasználó által megadott módon itt folytatódik...]
     
     results = {
         'status': 'success',
@@ -390,19 +394,77 @@ async def scrape_tubitv(url: str, target_api_enabled: bool, har_enabled: bool, s
                     if device_id_from_token:
                         results['tubi_device_id'] = device_id_from_token
                         logging.info("📱 Device ID kinyerve a token payloadból (Fallback 2).")
-    
+            
             return results
+
 
 # ----------------------------------------------------------------------
 # FLASK ÚTVONAL KEZELÉS - MODOSÍTOTT
 # ----------------------------------------------------------------------
 
-@app.route('/scrape', methods=['GET'])
+@app.route('/scrape', methods=['GET', 'POST']) # <--- VÁLTOZTATÁS: POST engedélyezése
 def scrape_tubi_endpoint():
+    
+    # --- 1. GENERIKUS PROXY POST KÉRÉS KEZELÉSE ---
+    # Ha a kérés POST és van JSON tartalom, feltételezzük, hogy egy generikus proxy hívás a cél
+    if request.method == 'POST':
+        try:
+            proxy_request_data = request.get_json()
+            
+            if not proxy_request_data:
+                 return jsonify({'status': 'failure', 'error': 'POST kérés érkezett, de a JSON törzs hiányzik vagy érvénytelen.'}), 400
+            
+            # Kinyerjük a továbbítandó kérés részleteit
+            target_url = proxy_request_data.get('url')
+            target_method = proxy_request_data.get('method', 'GET').upper() # Az eredeti metódus (pl. POST)
+            target_headers = proxy_request_data.get('headers', {})
+            target_json_data = proxy_request_data.get('json_data')
+            
+            if not target_url:
+                return jsonify({'status': 'failure', 'error': 'Hiányzó "url" a proxy kérés JSON-jában.'}), 400
+
+            logging.info(f"🚀 Generikus proxy hívás indítása: {target_method} {target_url[:80]}...")
+            
+            # Elküldjük a kérést az eredeti API-nak
+            # A requests.request() kezeli a GET, POST, stb. metódusokat dinamikusan
+            response = requests.request(
+                method=target_method,
+                url=target_url,
+                headers=target_headers,
+                json=target_json_data, # json paraméter használata a törzshöz (Roku POST)
+                timeout=15 
+            )
+            
+            # Visszaadjuk az eredeti API válaszát (a status code és a tartalom)
+            return jsonify({
+                "status": "success",
+                "statusCode": response.status_code,
+                "headers": dict(response.headers),
+                # A tartalom text formában jön vissza, hogy a kliens tudja kezelni a JSON.loads-ot
+                "content": response.text 
+            })
+            
+        except requests.exceptions.RequestException as e:
+            logging.error(f"❌ Generikus proxy hívási hiba: {e}")
+            return jsonify({
+                "status": "failure", 
+                "error": f"Hiba a külső API hívás során: {e}",
+                "statusCode": getattr(e.response, 'status_code', 500)
+            }), 500
+        except Exception as e:
+            logging.error(f"❌ Generikus proxy belső hiba: {e}")
+            return jsonify({"status": "failure", "error": f"Belső szerver hiba a proxy kezelésekor: {e}"}), 500
+    # --- GENERIKUS PROXY POST KÉRÉS KEZELÉS VÉGE ---
+
+    # --- 2. EREDETI TUBI GET KÉRÉS KEZELÉSE (A korábbi logika) ---
+    
     url = request.args.get('url')
     if not url:
+        # Ha a POST végigfutott volna a fenti blokkban, ez már nem fut le.
+        # Ha ez GET, de hiányzik az 'url', hiba.
         return jsonify({'status': 'failure', 'error': 'Hiányzó "url" paraméter.'}), 400
     
+    # ... (A korábbi, hosszú Tubi logika innen folytatódik változatlanul) ...
     initial_target_api_enabled = request.args.get('target_api', '').lower() == 'true'
     har_enabled = request.args.get('har', '').lower() == 'true'
     simple_log_enabled = request.args.get('simple_log', '').lower() == 'true'
@@ -506,19 +568,19 @@ def scrape_tubi_endpoint():
         is_only_html_requested = html_requested and not json_outputs_requested
         
         if is_only_html_requested and final_data.get('html_content') and final_data.get('status') == 'success':
-              return Response(final_data['html_content'], mimetype='text/html')
+             return Response(final_data['html_content'], mimetype='text/html')
             
         if final_data.get('status') == 'failure' and not target_api_enabled:
-              return jsonify(final_data)
+             return jsonify(final_data)
         
         # Ez a rész a target_api-ra vonatkozik, ha NEM évadletöltés történt.
         # A Playwright alatti polling miatt a külső retry-ra nincs szükség (retry_count=1).
         if target_api_enabled and (not token_present or not api_data_present):
-              # Mivel a retry_count 1, ez azonnal visszatér, ha a 40 másodperc alatt nem volt siker
-              return jsonify(final_data)
+             # Mivel a retry_count 1, ez azonnal visszatér, ha a 40 másodperc alatt nem volt siker
+             return jsonify(final_data)
 
         if final_data.get('status') == 'success' and (not target_api_enabled or (token_present and api_data_present)):
-              return jsonify(final_data)
+             return jsonify(final_data)
         
         # A külső retry logic is leegyszerűsödik 1 kísérletre a belső polling miatt.
         if final_data.get('status') == 'failure' and target_api_enabled:
