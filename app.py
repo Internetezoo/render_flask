@@ -10,13 +10,13 @@ from flask import Flask, request, jsonify, Response
 from playwright.async_api import async_playwright, Route
 from typing import Optional, Dict
 
-# Aszinkron loop engedélyezése Flask alatt
+# Aszinkron loop engedélyezése Flask környezetben
 nest_asyncio.apply()
 
 app = Flask(__name__)
 app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
 
-# Logging beállítása
+# Naplózás beállítása a Render konzolhoz
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -30,7 +30,7 @@ TUBI_CONTENT_API_PARAMS = (
 )
 
 def decode_jwt_payload(jwt_token: str) -> Optional[str]:
-    """JWT Tokenből a Device ID kinyerése."""
+    """Kinyeri a device_id-t a JWT tokenből, ha a fejléc hiányzik."""
     try:
         parts = jwt_token.split('.')
         if len(parts) < 2: return None
@@ -42,7 +42,7 @@ def decode_jwt_payload(jwt_token: str) -> Optional[str]:
         return None
 
 async def scrape_full_stealth(url: str, opts: Dict):
-    """Playwright alapú scraper minden extra funkcióval."""
+    """Playwright alapú intelligens scraper minden adatgyűjtő funkcióval."""
     res = {
         'status': 'success',
         'url': url,
@@ -58,6 +58,7 @@ async def scrape_full_stealth(url: str, opts: Dict):
     har_path = har_filename if opts.get('har') else None
     
     async with async_playwright() as p:
+        # Stealth mód: elrejti az automatizáció nyomait
         browser = await p.chromium.launch(
             headless=True, 
             args=['--disable-blink-features=AutomationControlled', '--no-sandbox']
@@ -70,34 +71,41 @@ async def scrape_full_stealth(url: str, opts: Dict):
         
         page = await context.new_page()
 
-        # Konzol naplózás
+        # [4] Konzol üzenetek elmentése
         page.on("console", lambda m: res['console_logs'].append({'t': m.type, 'x': m.text}))
         
         async def handle_route(route: Route):
-            auth = route.request.headers.get('authorization', '')
+            req = route.request
+            auth = req.headers.get('authorization', '')
+            
+            # Token és Device ID vadászat
             if 'Bearer ' in auth and not res['tubi_token']:
                 token = auth.split('Bearer ')[1].strip()
                 res['tubi_token'] = token
-                res['tubi_device_id'] = route.request.headers.get(DEVICE_ID_HEADER.lower()) or decode_jwt_payload(token)
-                res['simple_log'].append(f"🔑 [AUTH] Token elkapva!")
+                res['tubi_device_id'] = req.headers.get(DEVICE_ID_HEADER.lower()) or decode_jwt_payload(token)
+                res['simple_log'].append(f"🔑 [AUTH] Token/DeviceID elkapva!")
 
+            # [5] Egyszerű hálózati naplózás
             if opts.get('simple'):
-                res['simple_log'].append(f"{route.request.method} | {route.request.url[:110]}")
+                res['simple_log'].append(f"{req.method} | {req.url[:110]}...")
             
             await route.continue_()
 
         await page.route("**/*", handle_route)
         
         try:
-            logging.info(f"🚀 Betöltés: {url}")
+            logging.info(f"🚀 Oldal betöltése: {url}")
             await page.goto(url, wait_until="networkidle", timeout=60000)
-            # Várunk, hogy a Pluto/Tubi szkriptek lefussanak
+            
+            # Pluto TV és dinamikus tartalmak miatt kell a várakozás
             await page.wait_for_timeout(5000)
+            
             res['html_content'] = await page.content()
         except Exception as e:
-            logging.error(f"Hiba: {e}")
+            logging.error(f"Scrape hiba: {e}")
             res['status'], res['error'] = 'failure', str(e)
 
+        # Kontextus zárása generálja le a HAR fájlt
         await context.close()
         
         if har_path and os.path.exists(har_path):
@@ -109,7 +117,7 @@ async def scrape_full_stealth(url: str, opts: Dict):
     return res
 
 @app.route('/scrape', methods=['GET', 'POST'])
-def handle():
+def handle_request():
     # --- POST ÁG (Közvetlen Proxy / Redirect Fix) ---
     if request.method == 'POST':
         d = request.get_json()
@@ -119,7 +127,7 @@ def handle():
                 url=d['url'],
                 headers=d.get('headers'),
                 timeout=30,
-                allow_redirects=True # Pluto TV 404 fix
+                allow_redirects=True # Kulcsfontosságú a Pluto TV redirectekhez
             )
             return jsonify({
                 "status": "success", 
@@ -130,34 +138,37 @@ def handle():
         except Exception as e:
             return jsonify({"error": str(e)}), 500
 
-    # --- GET ÁG (Dinamikus választó: url vagy web) ---
+    # --- GET ÁG (Dinamikus válasz: HTML vagy JSON) ---
     
-    # Prioritás: ha van 'web', az a cél, ha nincs, akkor az 'url'
-    target_url = request.args.get('web') or request.args.get('url')
+    # Megnézzük, melyik paramétert adta meg a felhasználó
+    web_url = request.args.get('web')
+    api_url = request.args.get('url')
+    target = web_url or api_url
     
-    if not target_url:
-        return "Hiba: Adj meg ?url= vagy ?web= paramétert!", 400
+    if not target:
+        return "Hiba: Használd a ?web=URL (HTML-hez) vagy ?url=URL (JSON-hez) formátumot!", 400
 
-    # Opciók a kérésből
+    # Opciók beállítása
     opts = {
         'har': request.args.get('har') == 'true',
-        'console': True, # Mindig gyűjtjük, a JSON-ben benne lesz
-        'simple': request.args.get('simple') == 'true' or request.args.get('web') is not None
+        'console': True,
+        'simple': request.args.get('simple') == 'true' or web_url is not None
     }
 
     # Playwright futtatása
-    data = asyncio.run(scrape_full_stealth(target_url, opts))
+    data = asyncio.run(scrape_full_stealth(target, opts))
 
-    # HA a felhasználó a 'web' paramétert használta (pl. yt-dlp vagy böngésző)
-    if request.args.get('web'):
-        logging.info(f"🌐 [WEB MODE] HTML válasz: {target_url}")
-        return Response(data.get('html_content', 'Betöltési hiba'), mimetype='text/html')
+    # Ha 'web' módban vagy (yt-dlp vagy böngésző) -> Tiszta HTML válasz
+    if web_url:
+        logging.info(f"🌐 [WEB MODE] HTML válasz küldése: {target}")
+        return Response(data.get('html_content', ''), mimetype='text/html')
 
-    # HA a felhasználó az 'url' paramétert használta (Python kliens)
-    logging.info(f"📊 [API MODE] JSON válasz: {target_url}")
+    # Ha 'url' módban vagy (Python kliens) -> Részletes JSON válasz
+    logging.info(f"📊 [API MODE] JSON válasz küldése: {target}")
     data['api_template'] = TUBI_CONTENT_API_PARAMS
     return jsonify(data)
 
 if __name__ == '__main__':
+    # Render kompatibilis port kezelés
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
