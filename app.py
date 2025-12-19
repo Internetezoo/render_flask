@@ -16,11 +16,11 @@ app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 DEVICE_ID_HEADER = "X-Tubi-Client-Device-ID"
-# EZ A CONTENT API BÁZIS URL
+# KÖTELEZŐ CONTENT API URL
 TUBI_CONTENT_API_BASE = "https://content-cdn.production-public.tubi.io/api/v2/content"
 
 def decode_jwt_device_id(token: str) -> Optional[str]:
-    """Kinyeri a device_id-t a JWT tokenből, ha a fejlécből hiányozna."""
+    """Kinyeri a device_id-t a JWT tokenből."""
     try:
         parts = token.split('.')
         payload = parts[1]
@@ -36,8 +36,7 @@ def extract_content_id(url: str) -> Optional[str]:
 
 def make_paginated_api_call(content_id, token, device_id, season_num, pages, page_size):
     """
-    Kifejezetten a Content API-t hívja meg a megadott paraméterekkel.
-    Itt nem használunk böngészőt, csak tiszta HTTP kérést.
+    Ez a rész felelős a Page 1, Page 2 letöltéséért a Content API-ból.
     """
     all_pages_data = []
     final_device_id = device_id or decode_jwt_device_id(token)
@@ -50,7 +49,7 @@ def make_paginated_api_call(content_id, token, device_id, season_num, pages, pag
 
     for p_idx in range(int(pages)):
         page_num = p_idx + 1
-        # A Tubi Content API által elvárt paraméterek
+        # A régi tubi_season.py_regi és az API paraméterezése
         params = {
             "app_id": "tubitv",
             "platform": "web",
@@ -63,22 +62,20 @@ def make_paginated_api_call(content_id, token, device_id, season_num, pages, pag
         }
         
         try:
-            logging.info(f"📡 Content API hívás: S{season_num} Page{page_num}")
+            logging.info(f"📡 API HÍVÁS: S{season_num} P{page_num}")
             resp = requests.get(TUBI_CONTENT_API_BASE, headers=headers, params=params, timeout=30)
             if resp.status_code == 200:
                 all_pages_data.append({
                     "page": page_num,
                     "json_content": resp.json()
                 })
-            else:
-                logging.error(f"❌ API Hiba {resp.status_code}: {resp.text}")
         except Exception as e:
-            logging.error(f"❌ Hálózati hiba az API hívásnál: {e}")
+            logging.error(f"Hiba: {e}")
             
     return all_pages_data
 
-async def get_initial_data(url: str):
-    """Böngészővel kinyeri a HTML-t (évadokhoz) és a Tokent."""
+async def get_token_and_html(url: str):
+    """Böngészővel kinyeri a tokent és a teljes HTML-t az évadkereséshez."""
     res = {'tubi_token': None, 'tubi_device_id': None, 'html_content': ""}
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -95,6 +92,7 @@ async def get_initial_data(url: str):
 
         await page.route("**/*", handle_route)
         await page.goto(url, wait_until="networkidle")
+        # Ez kell az évadok kinyeréséhez a tubi_season.py-nak
         res['html_content'] = await page.content()
         await browser.close()
     return res
@@ -102,27 +100,26 @@ async def get_initial_data(url: str):
 @app.route('/scrape', methods=['GET'])
 def main_endpoint():
     url = request.args.get('url')
-    season = request.args.get('season') # Csak az epizód letöltésnél van értéke
+    season = request.args.get('season')
     
     if not url: return jsonify({"status": "error"}), 400
 
-    # 1. Alap adatok kérése (mindig kell a token és a HTML)
-    data = asyncio.run(get_initial_data(url))
+    # 1. Először mindig leszedjük a tokent és a HTML-t
+    data = asyncio.run(get_token_and_html(url))
     
-    # 2. HA VAN SEASON, akkor a Content API-t hívjuk a meglévő tokennel
+    # 2. Csak ha a tubi_season konkrét évadot kér (&season=X), akkor hívjuk a Content API-t
     if season and data['tubi_token']:
         c_id = extract_content_id(url)
-        # Itt történik a tényleges Content API hívás
+        # Content API hívás (Page 1-2)
         data['page_data'] = make_paginated_api_call(
             c_id, data['tubi_token'], data['tubi_device_id'], 
             season, request.args.get('pages', 2), request.args.get('page_size', 20)
         )
-        data['status'] = 'success' if data['page_data'] else 'failure'
     else:
-        # Ha nincs season, akkor csak az évadokat fogja keresni a tubi_season.py a válaszban
+        # Évadkereséskor üres a page_data, a tubi_season a HTML-ből dolgozik
         data['page_data'] = []
-        data['status'] = 'success'
 
+    data['status'] = 'success'
     return jsonify(data)
 
 if __name__ == '__main__':
