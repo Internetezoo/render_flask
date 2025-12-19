@@ -7,17 +7,13 @@ import os
 import time
 import requests
 import re
-import urllib.parse
 from flask import Flask, request, jsonify, Response
 from playwright.async_api import async_playwright, Route
-from typing import Optional, Dict, List, Any
-from urllib.parse import urlparse, parse_qs, unquote
 
-# Engedélyezi az aszinkron funkciók beágyazását
+# Aszinkron loop engedélyezése Flask alatt
 nest_asyncio.apply()
 
 app = Flask(__name__)
-app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- KONFIGURÁCIÓK ---
@@ -30,103 +26,87 @@ TUBI_CONTENT_API_PARAMS = (
     "limit_resolutions[]=h264_1080p&video_resources[]=hlsv6"
 )
 
-# --- SEGÉDFÜGGVÉNYEK ---
-def decode_jwt_payload(jwt_token: str) -> Optional[str]:
+def decode_jwt_payload(jwt_token: str):
+    """Kinyeri a device_id-t a tokenből, ha a fejléc hiányzik."""
     try:
-        payload_base64 = jwt_token.split('.')[1]
-        padding = '=' * (4 - len(payload_base64) % 4)
-        payload_decoded = base64.b64decode(payload_base64 + padding).decode('utf-8')
-        return json.loads(payload_decoded).get('device_id')
+        payload_b64 = jwt_token.split('.')[1]
+        padding = '=' * (4 - len(payload_b64) % 4)
+        return json.loads(base64.b64decode(payload_b64 + padding).decode('utf-8')).get('device_id')
     except: return None
 
-def extract_content_id(url: str) -> Optional[str]:
-    match = re.search(r'/(\d+)/', url)
-    return match.group(1) if match else None
+def extract_id(url):
+    """Kinyeri a numerikus ID-t a Tubi URL-ből."""
+    m = re.search(r'/(\d+)/', url)
+    return m.group(1) if m else None
 
-# --- FEJLETT API HÍVÓ (A HOSSZABB KÓDBÓL) ---
-def make_paginated_api_call(content_id, token, device_id, user_agent, season, pages, size):
-    results = []
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "User-Agent": user_agent,
-        DEVICE_ID_HEADER: device_id,
-        "Accept": "application/json"
-    }
-    for p in range(1, pages + 1):
-        url = f"{TUBI_CONTENT_API_BASE}?{TUBI_CONTENT_API_PARAMS.format(content_id=content_id, device_id=device_id, season_num=season, page_num=p, page_size=size)}"
-        try:
-            r = requests.get(url, headers=headers, timeout=10)
-            if r.status_code == 200:
-                results.append({"page": p, "json_content": r.json()})
-                logging.info(f"✅ S{season} P{p} letöltve.")
-        except Exception as e:
-            logging.error(f"❌ Hiba az API hívásnál: {e}")
-    return results
-
-# --- A SCRAPE LOGIKA ---
-async def scrape_tubi(url, target_api=False):
-    res = {'status': 'success', 'tubi_token': None, 'tubi_device_id': None, 'html': '', 'ua': ''}
-    
+async def scrape_tubi_core(url):
+    res = {"status": "success", "tubi_token": None, "tubi_device_id": None, "html": "", "debug_info": []}
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
         page = await context.new_page()
-        res['ua'] = await page.evaluate("navigator.userAgent")
 
-        if target_api:
-            async def handle_route(route: Route):
-                headers = route.request.headers
-                if 'authorization' in headers and not res['tubi_token']:
-                    res['tubi_token'] = headers['authorization'].replace('Bearer ', '')
-                if DEVICE_ID_HEADER.lower() in headers:
-                    res['tubi_device_id'] = headers[DEVICE_ID_HEADER.lower()]
-                await route.continue_()
-            await page.route("**/*", handle_route)
+        async def intercept(route: Route):
+            h = route.request.headers
+            if 'authorization' in h and 'Bearer' in h['authorization'] and not res['tubi_token']:
+                res['tubi_token'] = h['authorization'].replace('Bearer ', '')
+                msg = f"🔑 TOKEN ELCSÍPVE: {res['tubi_token'][:15]}..."
+                res['debug_info'].append(msg)
+                logging.info(msg)
+            if DEVICE_ID_HEADER.lower() in h:
+                res['tubi_device_id'] = h[DEVICE_ID_HEADER.lower()]
+            await route.continue_()
 
+        await page.route("**/*", intercept)
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
         
-        # Token várakozás (max 10mp)
+        # Várakozás a hálózati forgalomra
         for _ in range(20):
             if res['tubi_token']: break
             await asyncio.sleep(0.5)
             
         res['html'] = await page.content()
-        
-        # Device ID fallback
+        # Fallback ha a fejlécben nem volt Device ID
         if res['tubi_token'] and not res['tubi_device_id']:
             res['tubi_device_id'] = decode_jwt_payload(res['tubi_token'])
+            res['debug_info'].append("📱 Device ID kinyerve a JWT tokenből.")
             
         await browser.close()
     return res
 
-# --- FLASK ENDPOINT ---
 @app.route('/scrape', methods=['GET'])
-def main_endpoint():
+def main_scrape():
     url = request.args.get('url')
-    if not url: return "Adj meg egy URL-t!", 400
-    
-    # Paraméterek az évadletöltéshez
+    is_api = request.args.get('target_api') == 'true'
     season = request.args.get('season')
-    pages = request.args.get('pages', 1)
-    size = request.args.get('page_size', 50)
     
-    # Futtatás
-    data = asyncio.run(scrape_tubi(url, target_api=True))
-    
-    # Ha évadot akarunk kinyerni ÉS megvan a token
-    if season and data['tubi_token'] and data['tubi_device_id']:
-        content_id = extract_content_id(url)
-        if content_id:
-            data['page_data'] = make_paginated_api_call(
-                content_id, data['tubi_token'], data['tubi_device_id'], 
-                data['ua'], int(season), int(pages), int(size)
-            )
-    
-    # Ha csak HTML-t kértek (web mód)
-    if request.args.get('target_api') != 'true':
-        return Response(data['html'], mimetype='text/html')
-    
-    return jsonify(data)
+    if not url: return jsonify({"error": "Nincs URL megadva"}), 400
+
+    # 1. Scrape futtatása a tokenért
+    data = asyncio.run(scrape_tubi_core(url))
+
+    # 2. Ha van token és évadot kértek, hívjuk meg az API-t a szerveren
+    if season and data['tubi_token']:
+        c_id = extract_id(url)
+        d_id = data.get('tubi_device_id', 'unknown')
+        api_url = f"{TUBI_CONTENT_API_BASE}?{TUBI_CONTENT_API_PARAMS.format(content_id=c_id, device_id=d_id, season_num=season, page_num=1, page_size=50)}"
+        
+        try:
+            r = requests.get(api_url, headers={
+                "Authorization": f"Bearer {data['tubi_token']}",
+                DEVICE_ID_HEADER: d_id
+            }, timeout=15)
+            if r.status_code == 200:
+                data['tubi_api_data'] = r.json()
+                data['debug_info'].append("✅ Szerveroldali API hívás sikeres.")
+            else:
+                data['debug_info'].append(f"❌ API hiba: {r.status_code}")
+        except Exception as e:
+            data['debug_info'].append(f"❌ Rendszerhiba az API hívásnál: {str(e)}")
+
+    if is_api:
+        return jsonify(data)
+    return Response(data['html'], mimetype='text/html')
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
