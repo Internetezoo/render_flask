@@ -4,19 +4,18 @@ import logging
 import re
 import os
 import requests
-import time
 from flask import Flask, request, jsonify, Response
 from playwright.async_api import async_playwright
 from typing import Optional
 
-# Flask + Playwright aszinkron híd
+# Engedélyezi az aszinkron futást Flask alatt
 nest_asyncio.apply()
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
 # --- GLOBÁLIS MUNKAMENET TÁROLÓ ---
-# Ez tárolja a tokent, hogy a második hívás villámgyors legyen
+# Itt jegyezzük meg a tokent és a device_id-t a böngészős kör után
 session_cache = {
     "token": None,
     "device_id": None
@@ -29,11 +28,11 @@ def extract_content_id(url: str) -> Optional[str]:
     match = re.search(r'/(?:series|movies|video)/(\d+)', url)
     return match.group(1) if match else None
 
-def make_paginated_api_call(content_id, token, device_id, season_num):
+def make_direct_content_api_call(content_id, token, device_id, season_num):
     """
-    Ez a függvény hívja meg KARAKTERRE PONTOSAN azt az API linket, amit kértél.
+    Ez a függvény hajtja végre a kért, paraméterezett Content API hívást.
     """
-    logging.info(f"📡 KÖZVETLEN API HÍVÁS -> ID: {content_id}, Season: {season_num}")
+    logging.info(f"📡 KÖZVETLEN API HÍVÁS: ID={content_id}, Season={season_num}")
     
     headers = {
         "Authorization": f"Bearer {token}",
@@ -41,7 +40,7 @@ def make_paginated_api_call(content_id, token, device_id, season_num):
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
     
-    # Pontos paraméterek: 50-es limit, DRM források (Widevine, Playready, Fairplay)
+    # Pontosan az általad kért URL paraméterek
     params = [
         ('app_id', 'tubitv'),
         ('platform', 'web'),
@@ -60,23 +59,18 @@ def make_paginated_api_call(content_id, token, device_id, season_num):
     ]
     
     try:
-        resp = requests.get(TUBI_CONTENT_API_BASE, headers=headers, params=params, timeout=20)
+        resp = requests.get(TUBI_CONTENT_API_BASE, headers=headers, params=params, timeout=15)
         if resp.status_code == 200:
-            logging.info("✅ API VÁLASZ SIKERES!")
-            return [resp.json()]
-        else:
-            logging.error(f"❌ API HIBA: {resp.status_code} - {resp.text}")
+            return resp.json()
+        return {"error": f"API error: {resp.status_code}"}
     except Exception as e:
-        logging.error(f"❌ API KIVÉTEL: {e}")
-    return []
+        return {"error": str(e)}
 
-async def run_browser_logic(url):
+async def run_playwright_scrapper(url):
     """
-    Böngésző indítása a Token és Device ID ellopásához.
+    Böngésző indítása a token elkapásához és a HTML kinyeréséhez.
     """
-    logging.info(f"🌐 BÖNGÉSZŐ INDÍTÁSA: {url}")
-    data = {"html": "", "token": None, "device_id": None}
-    
+    data = {"token": None, "device_id": None, "html": ""}
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
@@ -84,80 +78,84 @@ async def run_browser_logic(url):
         )
         page = await context.new_page()
 
-        # Hálózati forgalom figyelése a tokenhez
+        # Token elkapása a hálózati forgalomból
         async def handle_request(route):
             auth = route.request.headers.get("authorization")
             dev_id = route.request.headers.get(DEVICE_ID_HEADER)
             if auth and "Bearer" in auth and not data["token"]:
                 data["token"] = auth.replace("Bearer ", "")
                 data["device_id"] = dev_id
-                logging.info(f"🔑 TOKEN ELKAPVA!")
+                logging.info("🔑 Token elkapva!")
             await route.continue_()
 
         await page.route("**/*", handle_request)
-        
-        try:
-            await page.goto(url, wait_until="networkidle", timeout=60000)
-            await asyncio.sleep(5) # Várjunk, hogy minden API kérés lefusson
-            data["html"] = await page.content()
-        finally:
-            await browser.close()
-            
+        await page.goto(url, wait_until="networkidle", timeout=60000)
+        await asyncio.sleep(5)
+        data["html"] = await page.content()
+        await browser.close()
     return data
 
 @app.route('/scrape', methods=['GET'])
 def scrape():
-    target_url = request.args.get('url')
-    season = request.args.get('season')
+    # Kapcsolók kinyerése
+    web_url = request.args.get('web')     # HTML választ ad (böngészőnek)
+    python_url = request.args.get('url') # JSON választ ad (Pythonnak)
+    season = request.args.get('season')  # Aktiválja a Content API-t
     
-    if not target_url:
+    target = web_url or python_url
+    if not target:
         return jsonify({"error": "Hiányzó URL!"}), 400
 
-    # --- FUNKCIÓ 1: Ha van season és van mentett token -> GYORS API MÓD ---
+    # 1. LOGIKA: Ha van season ÉS van már tokenünk -> KÖZVETLEN API HIVÁS
     if season and session_cache["token"]:
-        logging.info("♻️ GYORS MÓD: Mentett token használata, nincs böngésző nyitás.")
-        c_id = extract_content_id(target_url)
-        if c_id:
-            p_data = make_paginated_api_call(
-                c_id, session_cache["token"], session_cache["device_id"], season
-            )
-            return jsonify({
-                "status": "success",
-                "tubi_token": session_cache["token"],
-                "page_data": p_data,
-                "html_content": "API MODE ACTIVE"
-            })
+        logging.info("⚡ GYORSÍTÓTÁR: Közvetlen Content API hívás böngésző nélkül.")
+        c_id = extract_content_id(target)
+        api_data = make_direct_content_api_call(
+            c_id, session_cache["token"], session_cache["device_id"], season
+        )
+        return jsonify({
+            "status": "success",
+            "page_data": [api_data],
+            "tubi_token": session_cache["token"]
+        })
 
-    # --- FUNKCIÓ 2: Első hívás vagy nincs token -> BÖNGÉSZŐS MÓD ---
+    # 2. LOGIKA: Token megszerzése és HTML kinyerése böngészővel
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        res = loop.run_until_complete(run_browser_logic(target_url))
+        browser_res = loop.run_until_complete(run_playwright_scrapper(target))
         
-        # Token elmentése a memóriába a következő híváshoz
-        if res["token"]:
-            session_cache["token"] = res["token"]
-            session_cache["device_id"] = res["device_id"]
-            logging.info("✅ TOKEN ELMENTVE A MEMÓRIÁBA.")
+        # Mentsük el a tokent a memóriába a későbbi API hívásokhoz
+        if browser_res["token"]:
+            session_cache["token"] = browser_res["token"]
+            session_cache["device_id"] = browser_res["device_id"]
     finally:
         loop.close()
 
-    # Ha már az első hívásnál is kértek évadot (ritka eset)
-    page_data = []
-    if season and session_cache["token"]:
-        c_id = extract_content_id(target_url)
-        page_data = make_paginated_api_call(
-            c_id, session_cache["token"], session_cache["device_id"], season
-        )
+    # 3. VÁLASZ ADÁSA A KAPCSOLÓK ALAPJÁN
+    # Ha a ?web= van használva, nyers HTML-t adunk vissza (pl. böngészőbe)
+    if web_url:
+        return Response(browser_res["html"], mimetype='text/html')
 
-    return jsonify({
+    # Ha a ?url= van használva (Python kliens), JSON-t adunk vissza
+    output = {
         "status": "success",
         "tubi_token": session_cache["token"],
         "tubi_device_id": session_cache["device_id"],
-        "page_data": page_data,
-        "html_content": res["html"]
-    })
+        "html_content": browser_res["html"],
+        "page_data": []
+    }
+
+    # Ha az első hívásban már kértek évadot, azt is belegyúrjuk
+    if season and session_cache["token"]:
+        c_id = extract_content_id(target)
+        output["page_data"] = [make_direct_content_api_call(
+            c_id, session_cache["token"], session_cache["device_id"], season
+        )]
+
+    return jsonify(output)
 
 if __name__ == '__main__':
+    # Render kompatibilis indítás
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
