@@ -6,11 +6,10 @@ import os
 import requests
 from flask import Flask, request, jsonify
 from playwright.async_api import async_playwright
-# JAVÍTÁS: Az aszinkron híváshoz a stealth_async szükséges
-from playwright_stealth import stealth_async
+# JAVÍTÁS: Egyszerű 'stealth' importálása
+from playwright_stealth import stealth
 from urllib.parse import urlparse
 
-# Szükséges a Flask + Playwright aszinkron futtatásához
 nest_asyncio.apply()
 
 app = Flask(__name__)
@@ -49,7 +48,6 @@ async def run_browser_logic(url, is_tubi):
     data = {'html': "", 'console_logs': [], 'token': None, 'device_id': None}
     
     async with async_playwright() as p:
-        # Browser indítása
         browser = await p.chromium.launch(
             headless=True, 
             args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"]
@@ -59,13 +57,12 @@ async def run_browser_logic(url, is_tubi):
         )
         page = await context.new_page()
 
-        # JAVÍTÁS: A stealth_async használata a modul helyett
-        await stealth_async(page)
+        # JAVÍTÁS: A 'stealth' függvény meghívása aszinkron módon
+        # A legtöbb modern verzióban ez így működik az async_api-val
+        await stealth(page)
 
-        # Konzol logok mentése
         page.on("console", lambda msg: data['console_logs'].append({'t': msg.type, 'x': msg.text}))
 
-        # Hálózati kérések figyelése (Tubi token kinyerése)
         async def handle_request(route):
             if route.request.resource_type in ["image", "media", "font"]:
                 await route.abort()
@@ -82,13 +79,11 @@ async def run_browser_logic(url, is_tubi):
         await page.route("**/*", handle_request)
         
         try:
-            # Oldal betöltése
             await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            # Várunk egy kicsit, hogy a scriptek lefussanak (pl. Cloudflare vagy Tubi auth)
             await asyncio.sleep(5)
             data['html'] = await page.content()
         except Exception as e:
-            data['html'] = f"Error during scraping: {str(e)}"
+            data['html'] = f"Error: {str(e)}"
         finally:
             await browser.close()
             
@@ -96,33 +91,26 @@ async def run_browser_logic(url, is_tubi):
 
 @app.route('/scrape', methods=['GET'])
 def scrape():
-    # URL kinyerése a paraméterekből
     web_url = request.args.get('web')
     python_url = request.args.get('url')
     target = web_url or python_url
     
     if not target:
-        return jsonify({"error": "No URL provided. Use ?web= or ?url="}), 400
+        return jsonify({"error": "No URL provided"}), 400
     
     is_tubi = is_tubi_url(target)
     
-    # Event loop kezelése Flask alatt
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
+    # Biztonságos event loop kezelés
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
         res = loop.run_until_complete(run_browser_logic(target, is_tubi))
-    except Exception as e:
-        return jsonify({"error": f"Event loop error: {str(e)}"}), 500
+    finally:
+        loop.close()
 
-    # HA BÖNGÉSZŐBŐL HÍVTAD (?web=) -> Nyers HTML-t adunk vissza
     if web_url:
         return res['html']
 
-    # HA KLIENSBŐL HÍVTAD (?url=) -> JSON válasz
     response_data = {
         "status": "success", 
         "html_content": res['html'],
@@ -131,21 +119,13 @@ def scrape():
         "tubi_device_id": res['device_id']
     }
     
-    # Ha Tubi és kérték az API hívást is
     if is_tubi and request.args.get('target_api') == 'true' and res['token']:
         c_id = extract_content_id(target)
         if c_id:
-            season = request.args.get('season', '1')
-            api_res = call_content_api(c_id, res['token'], res['device_id'], season)
-            response_data["page_data"] = api_res
+            response_data["page_data"] = call_content_api(c_id, res['token'], res['device_id'], request.args.get('season', '1'))
 
     return jsonify(response_data)
 
-@app.route('/')
-def index():
-    return "Playwright Scraper is running. Use /scrape?web=URL"
-
 if __name__ == '__main__':
-    # Render.com-hoz szükséges port beállítás
     port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port)
