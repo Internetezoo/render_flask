@@ -8,169 +8,163 @@ from flask import Flask, request, jsonify, Response
 from playwright.async_api import async_playwright
 from typing import Optional
 
-# Engedélyezi az aszinkron futást Flask alatt (Render/Local környezetben szükséges)
+# Engedélyezi az aszinkron futást Flask alatt
 nest_asyncio.apply()
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
 # --- GLOBÁLIS MUNKAMENET TÁROLÓ ---
-# Itt jegyezzük meg a tokent és a device_id-t, hogy ne kelljen minden kéréshez böngészőt indítani
 session_cache = {
-    "token": None,
-    "device_id": None
+    "tubi_token": None,
+    "tubi_device_id": None,
+    "roku_csrf": None
 }
 
 DEVICE_ID_HEADER = "x-tubi-client-device-id"
 TUBI_CONTENT_API_BASE = "https://content-cdn.production-public.tubi.io/api/v2/content"
 
-def extract_content_id(url: str) -> Optional[str]:
-    """Kinyeri a numerikus Content ID-t a Tubi URL-ből."""
+# --- SEGÉDFÜGGVÉNYEK ---
+def extract_tubi_id(url: str) -> Optional[str]:
     match = re.search(r'/(?:series|movies|video)/(\d+)', url)
     return match.group(1) if match else None
 
-def make_direct_content_api_call(content_id, token, device_id, season_num):
-    """
-    Közvetlen hívás a Tubi Content API-ra a már megszerzett tokennel.
-    """
-    logging.info(f"📡 KÖZVETLEN API HÍVÁS: ID={content_id}, Season={season_num}")
-    
+def is_roku_url(url: str) -> bool:
+    return "therokuchannel.roku.com" in url
+
+# --- DIREKT API HÍVÁSOK ---
+def make_direct_tubi_call(content_id, token, device_id, season_num):
+    """Közvetlen Tubi API hívás böngésző nélkül."""
     headers = {
         "Authorization": f"Bearer {token}",
         DEVICE_ID_HEADER: device_id,
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
-    
-    # Tubi API paraméterek
     params = [
-        ('app_id', 'tubitv'),
-        ('platform', 'web'),
-        ('content_id', content_id),
-        ('device_id', device_id),
-        ('include_channels', 'true'),
-        ('pagination[season]', str(season_num)),
-        ('pagination[page_in_season]', '1'),
-        ('pagination[page_size_in_season]', '50'),
-        ('limit_resolutions[]', 'h264_1080p'),
-        ('limit_resolutions[]', 'h265_1080p'),
-        ('video_resources[]', 'hlsv6_widevine_nonclearlead'),
-        ('video_resources[]', 'hlsv6_playready_psshv0'),
-        ('video_resources[]', 'hlsv6_fairplay'),
-        ('video_resources[]', 'hlsv6')
+        ('app_id', 'tubitv'), ('platform', 'web'), ('content_id', content_id),
+        ('device_id', device_id), ('pagination[season]', str(season_num)),
+        ('video_resources[]', 'hlsv6_widevine_nonclearlead')
     ]
-    
     try:
         resp = requests.get(TUBI_CONTENT_API_BASE, headers=headers, params=params, timeout=15)
-        if resp.status_code == 200:
-            return resp.json()
-        return {"error": f"API error: {resp.status_code}", "status": "error"}
+        return resp.json() if resp.status_code == 200 else {"error": f"Tubi API hiba: {resp.status_code}"}
     except Exception as e:
-        return {"error": str(e), "status": "error"}
+        return {"error": str(e)}
 
+# --- BÖNGÉSZŐ ALAPÚ SCRAPER (Token elkapáshoz) ---
 async def run_playwright_scrapper(url):
-    """
-    Playwright böngésző indítása a token elkapásához és a HTML kinyeréséhez.
-    """
-    data = {"token": None, "device_id": None, "html": ""}
+    """Böngészőt indít és figyeli a hálózati forgalmat a tokenekért."""
+    data = {"tubi_token": None, "tubi_device_id": None, "roku_csrf": None, "html": ""}
     async with async_playwright() as p:
-        # headless=True szükséges a felhő alapú futtatáshoz (Render)
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
         page = await context.new_page()
 
-        # Token elkapása a hálózati forgalomból (Bearer token keresése)
         async def handle_request(route):
+            # Tubi Token elkapása
             auth = route.request.headers.get("authorization")
-            dev_id = route.request.headers.get(DEVICE_ID_HEADER)
-            if auth and "Bearer" in auth and not data["token"]:
-                data["token"] = auth.replace("Bearer ", "")
-                data["device_id"] = dev_id
-                logging.info("🔑 Token sikeresen elkapva!")
+            if auth and "Bearer" in auth:
+                data["tubi_token"] = auth.replace("Bearer ", "")
+                data["tubi_device_id"] = route.request.headers.get(DEVICE_ID_HEADER)
+            
+            # Roku CSRF elkapása
+            csrf = route.request.headers.get("csrf-token")
+            if csrf:
+                data["roku_csrf"] = csrf
+            
             await route.continue_()
 
         await page.route("**/*", handle_request)
-        await page.goto(url, wait_until="networkidle", timeout=60000)
-        # Várunk egy kicsit, hogy minden API hívás lefusson
-        await asyncio.sleep(5)
-        data["html"] = await page.content()
-        await browser.close()
+        try:
+            await page.goto(url, wait_until="networkidle", timeout=60000)
+            await asyncio.sleep(5) # Várunk az aszinkron API hívásokra
+            data["html"] = await page.content()
+        except Exception as e:
+            logging.error(f"Playwright hiba: {e}")
+        finally:
+            await browser.close()
     return data
 
+# --- FLASK VÉGPONTOK ---
 @app.route('/scrape', methods=['GET', 'POST'])
 def scrape():
-    """
-    Fő végpont, amely kezeli a GET és POST kéréseket is.
-    """
-    # Adatok kinyerése a kérés típusától függően
-    if request.method == 'POST':
-        # Ha JSON body-ban érkezik az adat
-        req_data = request.get_json() or {}
-        web_url = req_data.get('web')
-        python_url = req_data.get('url')
-        season = req_data.get('season')
-    else:
-        # Ha URL paraméterekben (GET) érkezik az adat
-        web_url = request.args.get('web')
-        python_url = request.args.get('url')
-        season = request.args.get('season')
+    # Bemeneti adatok feldolgozása (POST JSON vagy GET paraméterek)
+    req_data = request.get_json() if request.method == 'POST' else request.args
+    web_url = req_data.get('web')
+    target_url = req_data.get('url') or web_url
+    season = req_data.get('season')
     
-    target = web_url or python_url
-    if not target:
-        return jsonify({"error": "Hiányzó URL!", "status": "error"}), 400
+    # 1. ROKU V3 DIREKT POST LOGIKA (Ha a kliens küld json_data-t)
+    json_payload = req_data.get('json_data')
+    if target_url and is_roku_url(target_url) and request.method == 'POST' and json_payload:
+        logging.info(f"📡 ROKU V3 DIREKT HÍVÁS: {target_url}")
+        headers = req_data.get('headers', {})
+        try:
+            resp = requests.post(target_url, json=json_payload, headers=headers, timeout=20)
+            return jsonify({
+                "status": "success",
+                "statusCode": resp.status_code,
+                "content": resp.text
+            })
+        except Exception as e:
+            return jsonify({"status": "error", "error": str(e)})
 
-    # 1. LOGIKA: Ha van season ÉS van már érvényes tokenünk -> Közvetlen API hívás (Gyors)
-    if season and session_cache["token"]:
-        logging.info("⚡ GYORSÍTÓTÁR: Közvetlen Content API hívás böngésző indítása nélkül.")
-        c_id = extract_content_id(target)
-        api_data = make_direct_content_api_call(
-            c_id, session_cache["token"], session_cache["device_id"], season
+    if not target_url:
+        return jsonify({"error": "Hiányzó URL (web vagy url paraméter)!"}), 400
+
+    # 2. TUBI GYORSÍTÓTÁR LOGIKA (Ha van már tokenünk)
+    if not is_roku_url(target_url) and season and session_cache["tubi_token"]:
+        logging.info("⚡ TUBI GYORSÍTÓTÁR: Közvetlen API hívás")
+        content_id = extract_tubi_id(target_url)
+        api_data = make_direct_tubi_call(
+            content_id, session_cache["tubi_token"], session_cache["tubi_device_id"], season
         )
         return jsonify({
             "status": "success",
-            "html_content": api_data,
-            "tubi_token": session_cache["token"]
+            "tubi_token": session_cache["tubi_token"],
+            "html_content": api_data
         })
 
-    # 2. LOGIKA: Ha nincs token, vagy nem season hívás -> Playwright futtatása (Lassú)
+    # 3. PLAYWRIGHT LOGIKA (Ha nincs token vagy frissítés kell)
+    logging.info(f"🌐 PLAYWRIGHT INDÍTÁSA: {target_url}")
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        browser_res = loop.run_until_complete(run_playwright_scrapper(target))
+        browser_res = loop.run_until_complete(run_playwright_scrapper(target_url))
         
-        # Elmentjük a megszerzett adatokat a későbbi hívásokhoz
-        if browser_res["token"]:
-            session_cache["token"] = browser_res["token"]
-            session_cache["device_id"] = browser_res["device_id"]
+        # Cache frissítése
+        if browser_res["tubi_token"]:
+            session_cache["tubi_token"] = browser_res["tubi_token"]
+            session_cache["tubi_device_id"] = browser_res["tubi_device_id"]
+        if browser_res["roku_csrf"]:
+            session_cache["roku_csrf"] = browser_res["roku_csrf"]
+            
     finally:
         loop.close()
 
-    # 3. VÁLASZ ÖSSZEÁLLÍTÁSA
-    # Ha web_url volt megadva, nyers HTML-t küldünk vissza
-    if web_url:
+    # Válasz összeállítása
+    if web_url: # Ha 'web' kulccsal kérték, adjunk vissza nyers HTML-t
         return Response(browser_res["html"], mimetype='text/html')
 
-    # Ha python_url (vagy csak szimpla scrape), JSON-t adunk vissza
+    # Alapértelmezett JSON válasz
     output = {
         "status": "success",
-        "tubi_token": session_cache["token"],
-        "tubi_device_id": session_cache["device_id"],
-        "html_content": browser_res["html"],
-        "page_data": []
+        "tubi_token": session_cache["tubi_token"],
+        "roku_csrf": session_cache["roku_csrf"],
+        "html_content": browser_res["html"]
     }
 
-    # Ha ebben a hívásban kértek évadot, de most szereztünk tokent, akkor most hívjuk le az API-t
-    if season and session_cache["token"]:
-        c_id = extract_content_id(target)
-        api_result = make_direct_content_api_call(
-            c_id, session_cache["token"], session_cache["device_id"], season
+    # Ha Tubi season kérés volt, de most kaptunk először tokent
+    if not is_roku_url(target_url) and season and session_cache["tubi_token"]:
+        content_id = extract_tubi_id(target_url)
+        output["html_content"] = make_direct_tubi_call(
+            content_id, session_cache["tubi_token"], session_cache["tubi_device_id"], season
         )
-        output["html_content"] = api_result # Felülírjuk a HTML-t a tiszta JSON adattal
 
     return jsonify(output)
 
 if __name__ == '__main__':
-    # Render.com-hoz szükséges port beállítás
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
