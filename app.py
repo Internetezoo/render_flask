@@ -5,6 +5,7 @@ import re
 import os
 import json
 import requests
+import time
 from flask import Flask, request, jsonify, Response
 from playwright.async_api import async_playwright
 from typing import Optional
@@ -16,7 +17,6 @@ logging.basicConfig(level=logging.INFO)
 # --- KONFIGURÁCIÓK ---
 DEVICE_ID_HEADER = "x-tubi-client-device-id"
 TUBI_CONTENT_API_BASE = "https://content-cdn.production-public.tubi.io/api/v2/content"
-# JAVÍTÁS: Widevine DRM paraméter hozzáadva a videó linkekért
 TUBI_CONTENT_API_PARAMS = (
     "app_id=tubitv&platform=web&content_id={content_id}&device_id={device_id}&"
     "include_channels=true&pagination%5Bseason%5D={season_num}&"
@@ -33,7 +33,7 @@ def make_paginated_api_call(content_id, token, device_id, season_num):
     headers = {
         "Authorization": f"Bearer {token}",
         DEVICE_ID_HEADER: device_id,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
     query = TUBI_CONTENT_API_PARAMS.format(
         content_id=content_id, device_id=device_id, 
@@ -41,19 +41,24 @@ def make_paginated_api_call(content_id, token, device_id, season_num):
     )
     api_url = f"{TUBI_CONTENT_API_BASE}?{query}"
     try:
-        resp = requests.get(api_url, headers=headers, timeout=15)
+        resp = requests.get(api_url, headers=headers, timeout=20)
         if resp.status_code == 200:
             logging.info("✅ TUBI API VÁLASZ SIKERES!")
             return [resp.json()]
+        else:
+            logging.error(f"❌ API HIBA: {resp.status_code}")
     except Exception as e:
-        logging.error(f"❌ API HIBA: {e}")
+        logging.error(f"❌ API KIVÉTEL: {e}")
     return []
 
 async def run_browser_logic(url, is_tubi):
     data = {"html": "", "token": None, "device_id": None}
     async with async_playwright() as p:
+        # Lassított indítás és "stealth" jellegű beállítások
         browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context()
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
         page = await context.new_page()
 
         if is_tubi:
@@ -63,19 +68,26 @@ async def run_browser_logic(url, is_tubi):
                 if auth and "Bearer" in auth and not data["token"]:
                     data["token"] = auth.replace("Bearer ", "")
                     data["device_id"] = dev_id
-                    logging.info(f"🔑 TOKEN ELKAPVA: {data['token'][:20]}...")
+                    logging.info(f"🔑 TOKEN ELKAPVA!")
                 await route.continue_()
             await page.route("**/*", handle_request)
 
-        await page.goto(url, wait_until="networkidle", timeout=60000)
-        data["html"] = await page.content()
-        await browser.close()
+        # Navigáció és várakozás
+        try:
+            await page.goto(url, wait_until="networkidle", timeout=60000)
+            # Kényszerített várakozás, hogy a háttér API hívások lefussanak (5-8 mp, ahogy kérted)
+            await asyncio.sleep(7) 
+            data["html"] = await page.content()
+        except Exception as e:
+            logging.error(f"Böngésző hiba: {e}")
+        finally:
+            await browser.close()
     return data
 
 @app.route('/scrape', methods=['GET'])
 def scrape():
-    web_url = request.args.get('web')     # Böngészős nézethez
-    python_url = request.args.get('url')   # JSON adatokhoz
+    web_url = request.args.get('web')
+    python_url = request.args.get('url')
     target = web_url or python_url
     season = request.args.get('season')
 
@@ -86,7 +98,7 @@ def scrape():
     asyncio.set_event_loop(loop)
     res = loop.run_until_complete(run_browser_logic(target, is_tubi))
 
-    # --- DEBUG LOG A SZERVER KONZOLRA ---
+    # DEBUG LOG A SZERVER KONZOLRA
     if res['token']:
         print(f"--- TOKEN STÁTUSZ: MEGVAN ({res['token'][:10]}...) ---")
     else:
@@ -98,12 +110,9 @@ def scrape():
         if c_id:
             page_data = make_paginated_api_call(c_id, res['token'], res['device_id'], season)
 
-    # WEB KAPCSOLÓ KEZELÉSE
     if web_url:
-        # Ha a 'web' paramétert használtad, HTML-t kapsz a böngészőbe
         return Response(res['html'], mimetype='text/html')
 
-    # Alapértelmezett: JSON válasz a python programnak
     return jsonify({
         "status": "success",
         "tubi_token": res['token'],
