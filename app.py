@@ -8,10 +8,9 @@ import re
 import os
 from flask import Flask, request, jsonify
 from playwright.async_api import async_playwright, Route
-from playwright_stealth import stealth_async
+from playwright_stealth import stealth  # 'stealth_async' helyett csak 'stealth'
 from urllib.parse import urlparse
 
-# Eseményhurok engedélyezése
 nest_asyncio.apply()
 
 app = Flask(__name__)
@@ -24,7 +23,6 @@ logging.basicConfig(
 
 DEVICE_ID_HEADER = "X-Tubi-Client-Device-ID"
 TUBI_CONTENT_API_BASE = "https://content-cdn.production-public.tubi.io/api/v2/content"
-# Proxy beállítása környezeti változóból (pl: http://user:pass@host:port)
 PROXY_SERVER = os.environ.get("PROXY_SERVER")
 
 def is_tubi_url(url: str) -> bool:
@@ -59,7 +57,7 @@ async def smart_scraper(url: str, is_tubi: bool, use_stealth: bool):
     async with async_playwright() as p:
         launch_args = {
             "headless": True,
-            "args": ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+            "args": ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-blink-features=AutomationControlled"]
         }
         if PROXY_SERVER:
             launch_args["proxy"] = {"server": PROXY_SERVER}
@@ -71,16 +69,15 @@ async def smart_scraper(url: str, is_tubi: bool, use_stealth: bool):
         )
         page = await context.new_page()
 
-        # Stealth mód aktiválása botvédelem ellen (Index, Tubi)
+        # Stealth mód alkalmazása az új szintaxis szerint
         if use_stealth:
-            await stealth_async(page)
+            await stealth(page)
 
-        # Erőforrás blokkolás a RAM kímélése érdekében
         async def block_aggressively(route: Route):
-            if route.request.resource_type in ["image", "media", "font"] or "google-analytics" in route.request.url:
+            # Erőforrás-takarékos mód Render-hez
+            if route.request.resource_type in ["image", "media", "font"]:
                 await route.abort()
             else:
-                # Tubi token elkapása a hálózati forgalomból
                 if is_tubi:
                     auth = route.request.headers.get("authorization")
                     dev_id = route.request.headers.get(DEVICE_ID_HEADER.lower())
@@ -96,13 +93,11 @@ async def smart_scraper(url: str, is_tubi: bool, use_stealth: bool):
             logging.info(f"🚀 Navigálás: {url}")
             await page.goto(url, wait_until="domcontentloaded", timeout=60000)
             
-            # Várunk a dinamikus tartalomra (Indexnél kevesebb, Tubinál több kell)
-            wait_time = 8 if is_tubi else 4
-            await asyncio.sleep(wait_time)
-            
+            # Dinamikus tartalom bevárása
+            await asyncio.sleep(8 if is_tubi else 4)
             res['html'] = await page.content()
         except Exception as e:
-            logging.error(f"❌ Playwright hiba: {e}")
+            logging.error(f"❌ Hiba: {e}")
             res['html'] = f"Error: {str(e)}"
         
         await browser.close()
@@ -110,7 +105,6 @@ async def smart_scraper(url: str, is_tubi: bool, use_stealth: bool):
 
 @app.route('/scrape', methods=['GET'])
 def main():
-    # Paraméterek kinyerése
     target_url = request.args.get('web') or request.args.get('url')
     is_web_mode = request.args.get('web') is not None
     target_api = request.args.get('target_api') == 'true'
@@ -120,26 +114,18 @@ def main():
         return jsonify({"status": "error", "message": "No URL provided"}), 400
 
     is_tubi = is_tubi_url(target_url)
-    
-    # Böngésző indítása (ha web mód, akkor kényszerített stealth)
     scraped_data = asyncio.run(smart_scraper(target_url, is_tubi, use_stealth=is_web_mode or is_tubi))
     
     result = {
         "status": "success",
         "is_tubi": is_tubi,
-        "mode": "browser" if is_web_mode else "python_api",
         "html_content": scraped_data['html']
     }
 
-    # Tubi specifikus adatok hozzáadása
     if is_tubi:
         token = scraped_data['token'] or request.args.get('token')
         device_id = scraped_data['device_id'] or request.args.get('device_id') or "48882a5d-40a1-4fc3-9fb5-4a68b8f393cb"
-        
-        result.update({
-            "tubi_token": token,
-            "tubi_device_id": device_id
-        })
+        result.update({"tubi_token": token, "tubi_device_id": device_id})
 
         if target_api and token:
             c_id = extract_content_id(target_url)
