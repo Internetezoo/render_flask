@@ -5,14 +5,14 @@ import re
 import requests
 from flask import Flask, request, jsonify, Response
 from playwright.async_api import async_playwright
-from typing import Optional, Dict
+from typing import Optional
 
 nest_asyncio.apply()
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# Globális tároló a tokennek, hogy ne kelljen kétszer böngészőt nyitni
-cache = {"token": None, "device_id": None}
+# Globális tároló a munkamenetnek
+session_cache = {"token": None, "device_id": None}
 
 DEVICE_ID_HEADER = "x-tubi-client-device-id"
 TUBI_CONTENT_API_BASE = "https://content-cdn.production-public.tubi.io/api/v2/content"
@@ -22,14 +22,14 @@ def extract_content_id(url: str) -> Optional[str]:
     return match.group(1) if match else None
 
 def make_paginated_api_call(content_id, token, device_id, season_num):
-    logging.info(f"🚀 KÜLDÉS A TUBI API-NAK: ID={content_id}, Season={season_num}")
+    logging.info(f"📡 SZERVER: Content API hívás indítása -> ID: {content_id}, Season: {season_num}")
     headers = {
         "Authorization": f"Bearer {token}",
         DEVICE_ID_HEADER: device_id,
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
     
-    # Pontos paraméterek, amiket küldtél
+    # A pontos paraméterek az 50-es limittel
     params = {
         "app_id": "tubitv",
         "platform": "web",
@@ -44,18 +44,18 @@ def make_paginated_api_call(content_id, token, device_id, season_num):
     }
     
     try:
-        resp = requests.get(TUBI_CONTENT_API_BASE, headers=headers, params=params, timeout=15)
+        resp = requests.get(TUBI_CONTENT_API_BASE, headers=headers, params=params, timeout=20)
         if resp.status_code == 200:
-            logging.info("✅ API VÁLASZ SIKERES!")
+            logging.info("✅ SZERVER: API válasz sikeresen megérkezett!")
             return [resp.json()]
-        logging.error(f"❌ API HIBA: {resp.status_code} - {resp.text}")
+        logging.error(f"❌ SZERVER: API hiba: {resp.status_code}")
     except Exception as e:
-        logging.error(f"❌ API KIVÉTEL: {e}")
+        logging.error(f"❌ SZERVER: API kivétel: {e}")
     return []
 
-async def get_token_with_playwright(url):
-    logging.info(f"🌐 Böngésző indítása tokenért: {url}")
-    res = {"html": "", "token": None, "device_id": None}
+async def get_token_via_playwright(url):
+    logging.info(f"🌐 SZERVER: Böngésző indítása a tokenért...")
+    res = {"token": None, "device_id": None, "html": ""}
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context()
@@ -67,63 +67,64 @@ async def get_token_with_playwright(url):
             if auth and "Bearer" in auth and not res["token"]:
                 res["token"] = auth.replace("Bearer ", "")
                 res["device_id"] = dev_id
-                logging.info(f"🔑 TOKEN ELKAPVA A SZERVEREN!")
+                logging.info("🔑 SZERVER: Token elkapva!")
             await route.continue_()
 
         await page.route("**/*", handle_request)
         await page.goto(url, wait_until="networkidle", timeout=60000)
-        await asyncio.sleep(5) # Várjunk, hogy minden betöltődjön
+        await asyncio.sleep(5) # Biztonsági várakozás
         res["html"] = await page.content()
         await browser.close()
     return res
 
 @app.route('/scrape', methods=['GET'])
 def scrape():
-    web_url = request.args.get('web')
     python_url = request.args.get('url')
+    web_url = request.args.get('web')
     season = request.args.get('season')
-    target = web_url or python_url
+    target = python_url or web_url
 
     if not target: return jsonify({"error": "Nincs URL"}), 400
 
-    # 1. HA VAN SEASON ÉS VAN CACHELT TOKEN -> AZONNAL API HÍVÁS
-    if season and cache["token"]:
-        logging.info("♻️ Cachelt token használata, nincs böngésző nyitás.")
+    # 1. LÉPÉS: Ha van season, próbáljuk meg a cache-elt tokent használni
+    if season and session_cache["token"]:
+        logging.info("♻️ SZERVER: Cache-elt token használata, átugorjuk a böngészőt.")
         c_id = extract_content_id(target)
-        page_data = make_paginated_api_call(c_id, cache["token"], cache["device_id"], season)
-        return jsonify({
-            "status": "success",
-            "tubi_token": cache["token"],
-            "page_data": page_data
-        })
+        page_data = make_paginated_api_call(c_id, session_cache["token"], session_cache["device_id"], season)
+        if page_data:
+            return jsonify({
+                "status": "success",
+                "tubi_token": session_cache["token"],
+                "page_data": page_data,
+                "source": "cache_api"
+            })
 
-    # 2. HA NINCS TOKEN VAGY ELSŐ HÍVÁS -> BÖNGÉSZŐ INDÍTÁSA
+    # 2. LÉPÉS: Ha nincs token, vagy első hívás, lefut a Playwright
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    res = loop.run_until_complete(get_token_with_playwright(target))
+    try:
+        browser_res = loop.run_until_complete(get_token_via_playwright(target))
+        session_cache["token"] = browser_res["token"]
+        session_cache["device_id"] = browser_res["device_id"]
+    finally:
+        loop.close()
 
-    if res["token"]:
-        cache["token"] = res["token"]
-        cache["device_id"] = res["device_id"]
-        print(f"--- TOKEN STÁTUSZ: MEGVAN ---")
-    else:
-        print("--- TOKEN STÁTUSZ: HIÁNYZIK! ---")
-
-    # Ha már az első hívásnál is volt season (ritka, de kezeljük)
+    # Ha évadot kért a kliens az első hívással
     page_data = []
-    if season and res["token"]:
+    if season and session_cache["token"]:
         c_id = extract_content_id(target)
-        page_data = make_paginated_api_call(c_id, res["token"], res["device_id"], season)
+        page_data = make_paginated_api_call(c_id, session_cache["token"], session_cache["device_id"], season)
 
+    # 3. LÉPÉS: Válasz küldése
     if web_url:
-        return Response(res['html'], mimetype='text/html')
+        return Response(browser_res["html"], mimetype='text/html')
 
     return jsonify({
         "status": "success",
-        "tubi_token": res['token'],
-        "tubi_device_id": res['device_id'],
+        "tubi_token": session_cache["token"],
+        "tubi_device_id": session_cache["device_id"],
         "page_data": page_data,
-        "html_content": res['html']
+        "html_content": browser_res["html"] if not season else "API mode"
     })
 
 if __name__ == '__main__':
