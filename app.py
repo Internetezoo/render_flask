@@ -16,6 +16,7 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
 # --- GLOBÁLIS MUNKAMENET TÁROLÓ ---
+# Ebben a szótárban tároljuk a tokent a későbbi gyors hívásokhoz
 session_cache = {
     "token": None,
     "device_id": None
@@ -62,10 +63,12 @@ def make_direct_content_api_call(content_id, token, device_id, season_num):
 
 async def run_advanced_scrapper(url, need_har=False):
     """Böngésző futtatása, token elkapása és adatok gyűjtése."""
-    # Protokoll kiegészítése, ha hiányzik
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
+    # Egyedi HAR fájlnév a process ID alapján
+    har_filename = f"temp_{os.getpid()}.har"
+    
     data = {
         "token": None, 
         "device_id": None, 
@@ -77,46 +80,56 @@ async def run_advanced_scrapper(url, need_har=False):
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        # HAR rögzítés, ha kérik
-        har_path = "temp.har" if need_har else None
-        context = await browser.new_context(
-            record_har_path=har_path,
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
+        
+        context_args = {
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        if need_har:
+            context_args["record_har_path"] = har_filename
+
+        context = await browser.new_context(**context_args)
         page = await context.new_page()
 
-        # Eseménykezelők: Token elkapás és Network log
+        # TOKEN ÉS NETWORK LOG ELKAPÁSA
         async def handle_request(route):
             req = route.request
             auth = req.headers.get("authorization")
             dev_id = req.headers.get(DEVICE_ID_HEADER)
             
+            # Csak az érvényes tokent mentjük el
             if auth and "Bearer" in auth and not data["token"]:
-                data["token"] = auth.replace("Bearer ", "")
-                data["device_id"] = dev_id
-                logging.info("🔑 Token elkapva!")
+                token_val = auth.replace("Bearer ", "").strip()
+                if token_val and token_val != "undefined":
+                    data["token"] = token_val
+                    data["device_id"] = dev_id
+                    logging.info("🔑 Token elkapva a hálózatból!")
                 
             data["simple_log"].append(f"{req.method} {req.url}")
             await route.continue_()
 
+        # Eseménykezelők regisztrálása a navigáció ELŐTT
         page.on("console", lambda msg: data["console_logs"].append({"t": msg.type, "x": msg.text}))
         await page.route("**/*", handle_request)
         
         try:
             logging.info(f"🚀 Navigálás: {url}")
             await page.goto(url, wait_until="networkidle", timeout=60000)
-            await asyncio.sleep(2) # Várunk a dinamikus tartalomra
+            await asyncio.sleep(3) # Idő a dinamikus tartalomnak
             data["html"] = await page.content()
         except Exception as e:
-            data["html"] = f"Navigációs hiba: {str(e)}"
+            data["html"] = f"Hiba: {str(e)}"
             logging.error(f"❌ Hiba: {e}")
         
-        await context.close() # HAR lezárása
+        # FONTOS: Előbb lezárjuk a kontextust, hogy a HAR fájl kiíródjon!
+        await context.close()
         
-        if need_har and os.path.exists("temp.har"):
-            with open("temp.har", "r", encoding="utf-8") as f:
-                data["har_content"] = json.load(f)
-            os.remove("temp.har")
+        if need_har and os.path.exists(har_filename):
+            try:
+                with open(har_filename, "r", encoding="utf-8") as f:
+                    data["har_content"] = json.load(f)
+                os.remove(har_filename)
+            except Exception as e:
+                data["har_content"] = {"error": f"HAR betöltési hiba: {str(e)}"}
             
         await browser.close()
     return data
@@ -131,9 +144,9 @@ def scrape():
     if not target_url:
         return jsonify({"error": "Hiányzó 'url' paraméter!"}), 400
 
-    # 1. LOGIKA: Gyorsítótár használata (Season kérés esetén, ha van token)
+    # 1. LOGIKA: CACHE HASZNÁLATA (Ha van már tokenünk)
     if season and session_cache["token"] and "tubitv.com" in target_url:
-        logging.info("⚡ Cache használata...")
+        logging.info("⚡ GYORSÍTÓTÁR (CACHE) HASZNÁLATA...")
         c_id = extract_content_id(target_url)
         api_data = make_direct_content_api_call(
             c_id, session_cache["token"], session_cache["device_id"], season
@@ -144,13 +157,13 @@ def scrape():
             "tubi_token": session_cache["token"]
         })
 
-    # 2. LOGIKA: Friss lekérés böngészővel
+    # 2. LOGIKA: FRISS LEKÉRÉS BÖNGÉSZŐVEL
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
         browser_res = loop.run_until_complete(run_advanced_scrapper(target_url, need_har))
         
-        # Mentsük el a tokent későbbre
+        # Globális cache frissítése az új adatokkal
         if browser_res["token"]:
             session_cache["token"] = browser_res["token"]
             session_cache["device_id"] = browser_res["device_id"]
@@ -172,7 +185,7 @@ def scrape():
         "page_data": []
     }
 
-    # Ha az első hívásban kértek évadot, lefut a Content API is
+    # Ha az első hívásban már kértek évadot, azt is visszaadjuk
     if season and session_cache["token"] and "tubitv.com" in target_url:
         c_id = extract_content_id(target_url)
         output["page_data"] = [make_direct_content_api_call(
@@ -182,5 +195,6 @@ def scrape():
     return jsonify(output)
 
 if __name__ == '__main__':
+    # Render/Koyeb kompatibilis indítás
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
