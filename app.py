@@ -6,7 +6,8 @@ import os
 import requests
 from flask import Flask, request, jsonify
 from playwright.async_api import async_playwright
-from playwright_stealth import stealth 
+# FONTOS JAVÍTÁS: Így kell importálni, hogy a függvényt kapjuk meg
+from playwright_stealth import stealth_async 
 from urllib.parse import urlparse
 
 nest_asyncio.apply()
@@ -20,7 +21,6 @@ def is_tubi_url(url):
     return "tubitv.com" in urlparse(url).netloc
 
 def extract_content_id(url):
-    # Kinyeri a számot a Tubi URL-ből
     match = re.search(r'series/(\d+)', url) or re.search(r'/(\d+)/', url)
     return match.group(1) if match else None
 
@@ -42,19 +42,20 @@ def call_content_api(content_id, token, device_id, season_num):
 async def run_browser_logic(url):
     data = {'html': "", 'console_logs': [], 'token': None, 'device_id': None}
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
+        # Lassabb indítás és extra argumentumok a stabilitásért
+        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"])
         context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
         page = await context.new_page()
-        await stealth(page)
 
-        # Konzol logok gyűjtése a kliens 4-es pontjához
+        # JAVÍTVA: Az aszinkron verziót hívjuk meg
+        await stealth_async(page)
+
         page.on("console", lambda msg: data['console_logs'].append({'t': msg.type, 'x': msg.text}))
 
         async def handle_request(route):
             if route.request.resource_type in ["image", "media", "font"]:
                 await route.abort()
             else:
-                # Token és Device ID kinyerése a fejlécekből
                 h = route.request.headers
                 auth, dev_id = h.get("authorization"), h.get(DEVICE_ID_HEADER)
                 if auth and "Bearer" in auth: 
@@ -65,8 +66,9 @@ async def run_browser_logic(url):
 
         await page.route("**/*", handle_request)
         try:
-            await page.goto(url, wait_until="networkidle", timeout=60000)
-            await asyncio.sleep(5)
+            # networkidle helyett domcontentloaded-et használunk, ha a Render lassú lenne
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            await asyncio.sleep(5) 
             data['html'] = await page.content()
         except Exception as e:
             data['html'] = f"Error: {str(e)}"
@@ -90,11 +92,9 @@ def scrape():
     finally:
         loop.close()
 
-    # HA BÖNGÉSZŐBŐL HÍVTAD (?web=)
     if web_url:
         return res_data['html']
 
-    # HA PYTHON KLIENSBŐL HÍVTAD (?url=)
     response = {
         "status": "success",
         "html_content": res_data['html'],
@@ -103,7 +103,6 @@ def scrape():
         "tubi_device_id": res_data['device_id']
     }
 
-    # Tubi API hívás, ha kérték
     if is_tubi_url(target) and request.args.get('target_api') == 'true' and res_data['token']:
         c_id = extract_content_id(target)
         season = request.args.get('season', '1')
@@ -113,4 +112,6 @@ def scrape():
     return jsonify(response)
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+    # Render port kezelés
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
