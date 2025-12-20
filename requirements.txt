@@ -3,3 +3,4 @@ playwright
 gunicorn
 nest-asyncio
 requests
+playwright-stealth
