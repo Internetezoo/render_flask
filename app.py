@@ -6,14 +6,22 @@ import os
 import requests
 from flask import Flask, request, jsonify, Response
 from playwright.async_api import async_playwright
-import playwright_stealth
 from urllib.parse import urlparse, urljoin
 
-# Aszinkron hurok engedélyezése Flask alatt
+# Flask + Playwright aszinkron híd
 nest_asyncio.apply()
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
+
+# Dinamikus stealth importálás a TypeError elkerülésére
+try:
+    from playwright_stealth import stealth_async as stealth_func
+except ImportError:
+    try:
+        from playwright_stealth import stealth as stealth_func
+    except ImportError:
+        stealth_func = None
 
 DEVICE_ID_HEADER = "x-tubi-client-device-id"
 TUBI_CONTENT_API_BASE = "https://content-cdn.production-public.tubi.io/api/v2/content"
@@ -26,38 +34,20 @@ def extract_content_id(url):
     return match.group(1) if match else None
 
 def fix_links(html, base_url):
-    """Átalakítja a relatív linkeket abszolútra, hogy localhoston is legyen CSS/Kép."""
+    """Abszolúttá teszi a linkeket a böngészőhöz, hogy legyen CSS/Kép."""
     def replacer(match):
         attr = match.group(1)
         url = match.group(2)
         if url.startswith('/') and not url.startswith('//'):
             return f'{attr}="{urljoin(base_url, url)}"'
         return match.group(0)
-    
     pattern = r'(href|src|action)="([^"]+)"'
     return re.sub(pattern, replacer, html)
 
-def call_content_api(content_id, token, device_id, season_num):
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "X-Tubi-Client-Device-ID": device_id,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    }
-    params = {
-        "app_id": "tubitv", "platform": "web", "content_id": content_id,
-        "device_id": device_id, "pagination[season]": str(season_num)
-    }
-    try:
-        resp = requests.get(TUBI_CONTENT_API_BASE, headers=headers, params=params, timeout=15)
-        return resp.json()
-    except Exception as e:
-        return {"error": str(e)}
-
 async def run_browser_logic(url, is_tubi, full_render=False):
-    data = {'html': "", 'console_logs': [], 'token': None, 'device_id': None}
-    
+    data = {'html': "", 'token': None, 'device_id': None}
     async with async_playwright() as p:
-        # Render.com kompatibilis indítás
+        # Render kompatibilis böngésző indítás
         browser = await p.chromium.launch(
             headless=True, 
             args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"]
@@ -67,14 +57,15 @@ async def run_browser_logic(url, is_tubi, full_render=False):
         )
         page = await context.new_page()
 
-        # Stealth mód aktiválása (Javított hívás)
-        await playwright_stealth.stealth_async(page)
-
-        page.on("console", lambda msg: data['console_logs'].append({'t': msg.type, 'x': msg.text}))
+        # Stealth mód aktiválása (ha elérhető a könyvtár)
+        if stealth_func:
+            try:
+                await stealth_func(page)
+            except Exception as e:
+                logging.warning(f"Stealth error: {e}")
 
         async def handle_request(route):
-            # Ha csak adat kell (?url=), blokkolunk mindent a sebességért. 
-            # Ha böngészni akarunk (?web=), akkor hagyunk mindent betöltődni.
+            # Sebesség optimalizálás: csak azt töltjük be, ami kell
             if not full_render and route.request.resource_type in ["image", "media", "font", "stylesheet"]:
                 await route.abort()
             else:
@@ -90,11 +81,10 @@ async def run_browser_logic(url, is_tubi, full_render=False):
         await page.route("**/*", handle_request)
         
         try:
-            # Várakozási stratégia: networkidle a teljes rendereléshez, domcontentloaded a gyors adathoz
-            wait_strategy = "networkidle" if full_render else "domcontentloaded"
-            await page.goto(url, wait_until=wait_strategy, timeout=60000)
+            # "load" várakozás a stabilitásért
+            wait_strategy = "load" if full_render else "domcontentloaded"
+            await page.goto(url, wait_until=wait_strategy, timeout=45000)
             
-            # Tubi esetén kell pár másodperc a tokenek lehalászásához
             if is_tubi:
                 await asyncio.sleep(5)
             elif full_render:
@@ -102,12 +92,10 @@ async def run_browser_logic(url, is_tubi, full_render=False):
 
             raw_html = await page.content()
             data['html'] = fix_links(raw_html, url) if full_render else raw_html
-            
         except Exception as e:
-            data['html'] = f"Error: {str(e)}"
+            data['html'] = f"Hiba történt a betöltés során: {str(e)}"
         finally:
             await browser.close()
-            
     return data
 
 @app.route('/scrape', methods=['GET'])
@@ -115,39 +103,25 @@ def scrape():
     web_url = request.args.get('web')
     python_url = request.args.get('url')
     target = web_url or python_url
-    
-    if not target:
-        return jsonify({"error": "Hasznald a ?web=URL vagy ?url=URL parametert!"}), 400
+    if not target: return jsonify({"error": "Használd: ?web=URL vagy ?url=URL"}), 400
     
     is_tubi = is_tubi_url(target)
-    
-    # Event loop kezelése
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        # Ha 'web' paraméter van, full_render=True (lassabb, de szebb)
         res = loop.run_until_complete(run_browser_logic(target, is_tubi, full_render=bool(web_url)))
     finally:
         loop.close()
 
     if web_url:
-        # Rendes HTML válasz a böngészőnek
         return Response(res['html'], mimetype='text/html')
 
-    # JSON válasz API hívásokhoz
-    response_data = {
-        "status": "success", 
+    return jsonify({
+        "status": "success",
         "tubi_token": res['token'],
         "tubi_device_id": res['device_id'],
         "html_content": res['html']
-    }
-    
-    if is_tubi and request.args.get('target_api') == 'true' and res['token']:
-        c_id = extract_content_id(target)
-        if c_id:
-            response_data["api_data"] = call_content_api(c_id, res['token'], res['device_id'], request.args.get('season', '1'))
-
-    return jsonify(response_data)
+    })
 
 @app.route('/')
 def health():
