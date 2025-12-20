@@ -6,8 +6,8 @@ import os
 import requests
 from flask import Flask, request, jsonify
 from playwright.async_api import async_playwright
-# JAVÍTÁS: Egyszerű 'stealth' importálása
-from playwright_stealth import stealth
+# MÓDOSÍTOTT IMPORT: A teljes modult hozzuk be
+import playwright_stealth 
 from urllib.parse import urlparse
 
 nest_asyncio.apply()
@@ -32,34 +32,23 @@ def call_content_api(content_id, token, device_id, season_num):
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     }
     params = {
-        "app_id": "tubitv", 
-        "platform": "web", 
-        "content_id": content_id,
-        "device_id": device_id, 
-        "pagination[season]": str(season_num)
+        "app_id": "tubitv", "platform": "web", "content_id": content_id,
+        "device_id": device_id, "pagination[season]": str(season_num)
     }
     try:
         resp = requests.get(TUBI_CONTENT_API_BASE, headers=headers, params=params, timeout=15)
         return resp.json()
-    except Exception as e:
-        return {"error": str(e)}
+    except: return None
 
 async def run_browser_logic(url, is_tubi):
     data = {'html': "", 'console_logs': [], 'token': None, 'device_id': None}
-    
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True, 
-            args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"]
-        )
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-        )
+        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"])
+        context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
         page = await context.new_page()
 
-        # JAVÍTÁS: A 'stealth' függvény meghívása aszinkron módon
-        # A legtöbb modern verzióban ez így működik az async_api-val
-        await stealth(page)
+        # JAVÍTOTT HÍVÁS: Explicit módon az aszinkron függvényt hívjuk a modulból
+        await playwright_stealth.stealth_async(page)
 
         page.on("console", lambda msg: data['console_logs'].append({'t': msg.type, 'x': msg.text}))
 
@@ -77,7 +66,6 @@ async def run_browser_logic(url, is_tubi):
                 await route.continue_()
 
         await page.route("**/*", handle_request)
-        
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=60000)
             await asyncio.sleep(5)
@@ -86,7 +74,6 @@ async def run_browser_logic(url, is_tubi):
             data['html'] = f"Error: {str(e)}"
         finally:
             await browser.close()
-            
     return data
 
 @app.route('/scrape', methods=['GET'])
@@ -95,12 +82,9 @@ def scrape():
     python_url = request.args.get('url')
     target = web_url or python_url
     
-    if not target:
-        return jsonify({"error": "No URL provided"}), 400
+    if not target: return jsonify({"error": "No URL"}), 400
     
     is_tubi = is_tubi_url(target)
-    
-    # Biztonságos event loop kezelés
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
@@ -111,7 +95,7 @@ def scrape():
     if web_url:
         return res['html']
 
-    response_data = {
+    response = {
         "status": "success", 
         "html_content": res['html'],
         "console_logs": res['console_logs'],
@@ -122,9 +106,9 @@ def scrape():
     if is_tubi and request.args.get('target_api') == 'true' and res['token']:
         c_id = extract_content_id(target)
         if c_id:
-            response_data["page_data"] = call_content_api(c_id, res['token'], res['device_id'], request.args.get('season', '1'))
+            response["page_data"] = call_content_api(c_id, res['token'], res['device_id'], request.args.get('season', '1'))
 
-    return jsonify(response_data)
+    return jsonify(response)
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
