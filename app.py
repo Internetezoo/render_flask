@@ -6,12 +6,11 @@ import os
 import requests
 from flask import Flask, request, jsonify
 from playwright.async_api import async_playwright
-# JAVÍTÁS: A stealth_async helyett a sima stealth kell
+# JAVÍTOTT IMPORT: A modulból importáljuk a függvényt
 from playwright_stealth import stealth 
 from urllib.parse import urlparse
 
 nest_asyncio.apply()
-
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
@@ -47,9 +46,10 @@ async def run_browser_logic(url, is_tubi):
         context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
         page = await context.new_page()
 
-        # JAVÍTÁS: A sima stealth függvényt hívjuk meg (ez működik async alatt is)
+        # Most már a függvényt hívjuk meg, nem a modult
         await stealth(page)
 
+        # Konzol logok gyűjtése a kliensnek
         page.on("console", lambda msg: data['console_logs'].append({'t': msg.type, 'x': msg.text}))
 
         async def handle_request(route):
@@ -78,6 +78,7 @@ async def run_browser_logic(url, is_tubi):
 
 @app.route('/scrape', methods=['GET'])
 def scrape():
+    # Paraméterek: ?web= (böngészőnek HTML) vagy ?url= (kliensnek JSON)
     web_url = request.args.get('web')
     python_url = request.args.get('url')
     target = web_url or python_url
@@ -88,25 +89,28 @@ def scrape():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        result_data = loop.run_until_complete(run_browser_logic(target, is_tubi))
+        res = loop.run_until_complete(run_browser_logic(target, is_tubi))
     finally:
         loop.close()
 
+    # HA BÖNGÉSZŐBŐL HÍVTAD -> HTML
     if web_url:
-        return result_data['html']
+        return res['html']
 
+    # HA KLIENSBŐL HÍVTAD -> Teljes JSON
     response = {
         "status": "success", 
-        "html_content": result_data['html'],
-        "console_logs": result_data['console_logs'],
-        "tubi_token": result_data['token'],
-        "tubi_device_id": result_data['device_id']
+        "html_content": res['html'],
+        "console_logs": res['console_logs'],
+        "tubi_token": res['token'],
+        "tubi_device_id": res['device_id']
     }
     
-    if is_tubi and request.args.get('target_api') == 'true' and result_data['token']:
+    # Tubi API automatikus hívása, ha van token és kérik
+    if is_tubi and request.args.get('target_api') == 'true' and res['token']:
         c_id = extract_content_id(target)
         if c_id:
-            response["page_data"] = call_content_api(c_id, result_data['token'], result_data['device_id'], request.args.get('season', '1'))
+            response["page_data"] = call_content_api(c_id, res['token'], res['device_id'], request.args.get('season', '1'))
 
     return jsonify(response)
 
